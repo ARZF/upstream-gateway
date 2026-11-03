@@ -1,0 +1,85 @@
+import logging
+from time import perf_counter
+
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
+
+from app.core.logging import log_event
+from app.db.database import Database
+from app.db.models import RequestRecord
+from app.schemas.request import ErrorDetails, ProcessRequest, ProcessResponse
+from app.services.provider_service import ProviderService
+
+router = APIRouter()
+
+
+def get_service(request: Request) -> ProviderService:
+    return request.app.state.provider_service
+
+
+def get_database(request: Request) -> Database:
+    return request.app.state.database
+
+
+@router.post(
+    "/api/v1/process", response_model=ProcessResponse,
+    responses={
+        500: {"model": ProcessResponse},
+        502: {"model": ProcessResponse}, 503: {"model": ProcessResponse},
+        504: {"model": ProcessResponse},
+    },
+)
+async def process(
+    body: ProcessRequest, request: Request,
+    service: ProviderService = Depends(get_service),
+    database: Database = Depends(get_database),
+) -> JSONResponse:
+    started = perf_counter()
+    request_id = request.state.request_id
+    outcome = await service.process(body.payload, request_id)
+    response = outcome.response
+    provider_payload = response.result
+    identifiers = (
+        provider_payload if isinstance(provider_payload, dict) else {}
+    )
+    record = RequestRecord(
+        request_id=request_id, selected_provider=response.provider,
+        request_payload=body.payload, provider_response=provider_payload,
+        provider_transaction_id=(
+            identifiers.get("id")
+            if isinstance(identifiers.get("id"), str) else None
+        ),
+        provider_request_id=(
+            identifiers.get("request_id")
+            if isinstance(identifiers.get("request_id"), str) else None
+        ),
+        http_status_code=outcome.http_status,
+        upstream_http_status_code=outcome.upstream_status,
+        processing_status=response.status,
+        total_latency_ms=(perf_counter() - started) * 1000,
+        error_details=response.error.model_dump() if response.error else None,
+        attempt_count=outcome.attempt_count,
+    )
+    try:
+        await run_in_threadpool(database.save, record)
+    except SQLAlchemyError:
+        log_event(
+            "persistence_error", level=logging.ERROR, request_id=request_id
+        )
+        response.status = "failed"
+        response.error = ErrorDetails(
+            code="persistence_error",
+            message=("Metadata could not be stored; "
+                     "the provider may have processed the request"),
+        )
+        response.latency_ms = (perf_counter() - started) * 1000
+        return JSONResponse(
+            status_code=500, content=response.model_dump(mode="json")
+        )
+    response.latency_ms = (perf_counter() - started) * 1000
+    return JSONResponse(
+        status_code=outcome.http_status,
+        content=response.model_dump(mode="json"),
+    )
