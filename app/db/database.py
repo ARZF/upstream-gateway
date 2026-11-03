@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -29,6 +29,10 @@ class Database:
     def initialize(self) -> None:
         # shortcut: create_all cannot alter tables, use migrations for changes.
         Base.metadata.create_all(self.engine)
+
+    def check_connection(self) -> None:
+        with self.engine.connect() as connection:
+            connection.execute(select(1).select_from(RequestRecord).limit(1))
 
     def save(self, record: RequestRecord) -> None:
         with Session(self.engine) as session, session.begin():

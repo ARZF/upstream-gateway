@@ -53,11 +53,14 @@ def create_app(
                 application.state.provider_service = ProviderService(
                     smart_router, ProviderClient(client)
                 )
+                application.state.ready = True
                 yield
         finally:
+            application.state.ready = False
             await run_in_threadpool(database.close)
 
     application = FastAPI(title="Upstream Gateway", lifespan=lifespan)
+    application.state.ready = False
     application.include_router(router)
 
     @application.exception_handler(RequestValidationError)

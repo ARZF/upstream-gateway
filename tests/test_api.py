@@ -10,10 +10,12 @@ from uuid import UUID
 import httpx
 import pytest
 import uvicorn
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.database import Database
 from app.db.models import RequestRecord
 from app.main import create_app
 
@@ -46,6 +48,101 @@ def get_record(app, request_id):
         assert record is not None
         session.expunge(record)
         return record
+
+
+@pytest.mark.asyncio
+async def test_health_endpoints_do_not_call_providers_or_store_records(open_api):
+    def handler(_):
+        pytest.fail("Health probes must not call providers")
+
+    async with open_api(handler) as (app, client):
+        for path, status in [("/health", "ok"), ("/ready", "ready")]:
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert response.json() == {"status": status}
+            UUID(response.headers["X-Request-ID"])
+        with Session(app.state.database.engine) as session:
+            assert session.scalar(select(func.count()).select_from(RequestRecord)) == 0
+        schema = (await client.get("/openapi.json")).json()
+        assert "/health" in schema["paths"]
+        assert "503" in schema["paths"]["/ready"]["get"]["responses"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_tracks_startup_and_shutdown(tmp_path):
+    app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'lifecycle.db'}"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+    ) as client:
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert (await client.get("/health")).status_code == 200
+        async with app.router.lifespan_context(app):
+            assert (await client.get("/ready")).status_code == 200
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert (await client.get("/health")).status_code == 200
+        assert app.state.http_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_readiness_database_failure_and_recovery(open_api, monkeypatch, caplog):
+    def connect():
+        raise OperationalError(
+            "secret SQL", {"password": "private-value"},
+            Exception("private database path"),
+        )
+
+    async with open_api(lambda _: pytest.fail("Unexpected provider call")) as (app, client):
+        with monkeypatch.context() as patch:
+            patch.setattr(app.state.database.engine, "connect", connect)
+            response = await client.get("/ready")
+            assert response.status_code == 503
+            assert response.json() == {"status": "not_ready"}
+            assert (await client.get("/health")).status_code == 200
+        assert (await client.get("/ready")).status_code == 200
+        assert "private" not in caplog.text
+        assert "secret SQL" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_requests_table_is_unavailable(open_api):
+    async with open_api(lambda _: pytest.fail("Unexpected provider call")) as (app, client):
+        with app.state.database.engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE requests")
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert (await client.get("/health")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_http_client_is_closed(open_api):
+    async with open_api(lambda _: pytest.fail("Unexpected provider call")) as (app, client):
+        await app.state.http_client.aclose()
+        assert (await client.get("/ready")).status_code == 503
+        assert (await client.get("/health")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_failed_database_initialization_leaves_app_not_ready(tmp_path, monkeypatch):
+    def initialize(_):
+        raise OperationalError("initialize", {}, Exception("private database path"))
+
+    monkeypatch.setattr(Database, "initialize", initialize)
+    app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'failed.db'}"))
+    with pytest.raises(OperationalError):
+        async with app.router.lifespan_context(app):
+            pytest.fail("Startup must not succeed")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+    ) as client:
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
+        assert (await client.get("/health")).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -100,12 +197,12 @@ async def test_sqlite_data_survives_app_recreation(open_api):
         request_id = response.json()["request_id"]
 
     def handler(_):
-        pytest.fail("The liveness probe must not call providers")
+        pytest.fail("The readiness probe must not call providers")
 
     async with open_api(handler) as (app, client):
-        response = await client.get("/openapi.json")
+        response = await client.get("/ready")
         assert response.status_code == 200
-        assert "/api/v1/process" in response.json()["paths"]
+        assert response.json() == {"status": "ready"}
         record = get_record(app, request_id)
         assert record.request_payload == {"marker": "persistent"}
         assert record.processing_status == "succeeded"
@@ -363,6 +460,8 @@ async def test_uvicorn_startup_and_endpoint_over_real_socket(tmp_path):
             ) as client:
                 schema = await client.get("/openapi.json")
                 assert "/api/v1/process" in schema.json()["paths"]
+                assert (await client.get("/health")).status_code == 200
+                assert (await client.get("/ready")).status_code == 200
                 response = await client.post("/api/v1/process", json={"payload": {}})
                 assert response.status_code == 200
                 assert response.json()["result"] == {"id": "smoke"}

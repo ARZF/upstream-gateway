@@ -23,6 +23,37 @@ def get_database(request: Request) -> Database:
     return request.app.state.database
 
 
+@router.get("/health", tags=["Health"])
+async def health() -> dict[str, str]:
+    """Liveness only; does not check dependencies."""
+    return {"status": "ok"}
+
+
+@router.get(
+    "/ready", tags=["Health"], response_model=dict[str, str],
+    responses={503: {
+        "description": "Required dependency unavailable or not initialized",
+    }},
+)
+async def ready(request: Request) -> JSONResponse:
+    """Check completed startup, the local HTTP client, and database access."""
+    is_ready = False
+    if request.app.state.ready and not request.app.state.http_client.is_closed:
+        try:
+            await run_in_threadpool(get_database(request).check_connection)
+        except SQLAlchemyError:
+            log_event(
+                "readiness_error", level=logging.WARNING,
+                request_id=request.state.request_id,
+            )
+        else:
+            is_ready = True
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={"status": "ready" if is_ready else "not_ready"},
+    )
+
+
 @router.post(
     "/api/v1/process", response_model=ProcessResponse,
     responses={

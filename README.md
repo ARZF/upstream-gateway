@@ -3,7 +3,7 @@
 A Python 3.14+ FastAPI backend that forwards `POST /api/v1/process` to one of
 three existing HTTP providers. It records metadata for successful and failed
 validated requests in SQLite. There are no provider implementations or live
-health probes in this project.
+provider health probes in this project.
 
 ## Install and run
 
@@ -125,11 +125,12 @@ enabled. Do not add workers or scale replicas: routing state and concurrency
 limits are process-local. A 30-second stop grace period allows normal request
 draining and the existing HTTPX/database shutdown handlers to run.
 
-The health check uses Python's standard library to GET `/openapi.json` locally.
-It succeeds only on a successful HTTP response after application startup and
-does not call providers or write database rows. It is a gateway liveness check,
-not a provider-availability or ongoing database-writability check. Docker marks
-an unhealthy container but does not restart it solely for being unhealthy.
+The health check uses Python's standard library to GET `/ready` locally,
+bypassing environment proxies. Connection errors, timeouts, and HTTP errors
+fail the check. No additional dependency is required. It checks startup and
+database accessibility without calling providers or writing database rows.
+Docker marks an unhealthy container but does not restart it solely for being
+unhealthy.
 
 To safely check the process route without invoking real providers:
 
@@ -178,6 +179,32 @@ UID/GID 10001 ownership before startup. A bind-mounted host directory instead
 of the named volume also needs write permission for UID/GID 10001.
 
 ## API usage
+
+### Health endpoints
+
+- `GET /health`: liveness, returns **200** with `{"status":"ok"}` when the
+  application can serve requests. It does not access the database or providers.
+- `GET /ready`: readiness, returns **200** with `{"status":"ready"}` only
+  after startup completes, while the shared HTTP client is open, and a
+  read-only query against SQLite's `requests` table succeeds. It returns
+  **503** with `{"status":"not_ready"}` before initialization, during
+  shutdown, or when a required local dependency is unavailable. Database
+  checks run in the existing worker thread pool, not on the async event loop.
+
+Both endpoints appear in `/docs` and `/openapi.json`, include `X-Request-ID`,
+and expose no configuration or internal error details. Neither calls upstream
+providers or records probe requests in SQLite. Readiness verifies database
+access and table availability, not write capacity, free disk space, or upstream
+provider availability. Startup failures still prevent Uvicorn from serving.
+
+```sh
+curl -i http://localhost:8000/health
+curl -i http://localhost:8000/ready
+```
+
+Use `curl.exe` in PowerShell.
+
+### Process requests
 
 The outer object must contain `payload`, which is an object. Its nested values
 may be any valid JSON: objects, arrays, strings, finite numbers, booleans, or
@@ -327,6 +354,8 @@ Tests use HTTPX `MockTransport` exclusively for external APIs and temporary
 SQLite databases. They cover success, selection, varying responses, timeouts,
 429 seconds/HTTP-date cooldowns, 5xx, fallback bounds, non-retryable 4xx, no
 providers, persistence errors, overload, cancellation, and invalid inputs.
+Health tests cover liveness, startup/shutdown readiness, closed HTTP clients,
+database connection failure/recovery, missing tables, and safe error responses.
 The Uvicorn smoke test starts a real loopback HTTP listener and invokes the
 endpoint with mocked upstreams, checking startup, persistence, and shutdown.
 Tests never contact the real provider servers.
