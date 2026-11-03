@@ -91,6 +91,27 @@ async def test_success_and_persistence(open_api, caplog):
 
 
 @pytest.mark.asyncio
+async def test_sqlite_data_survives_app_recreation(open_api):
+    async with open_api(lambda _: httpx.Response(200, json={})) as (_, client):
+        response = await client.post(
+            "/api/v1/process", json={"payload": {"marker": "persistent"}}
+        )
+        assert response.status_code == 200
+        request_id = response.json()["request_id"]
+
+    def handler(_):
+        pytest.fail("The liveness probe must not call providers")
+
+    async with open_api(handler) as (app, client):
+        response = await client.get("/openapi.json")
+        assert response.status_code == 200
+        assert "/api/v1/process" in response.json()["paths"]
+        record = get_record(app, request_id)
+        assert record.request_payload == {"marker": "persistent"}
+        assert record.processing_status == "succeeded"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_payload", [{}, [1, None], "ok", None])
 async def test_preserves_variable_json_response(open_api, provider_payload):
     def handler(_):

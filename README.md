@@ -31,14 +31,17 @@ database initialization errors prevent startup. Interactive API docs are at
 ## Configuration
 
 All settings in `app/core/config.py` are configurable with uppercase environment
-variables. `.env.example` lists every setting and its default. The app reads the
-process environment, not `.env` files; no dotenv dependency is needed.
+variables. `.env.example` documents every setting, with example provider URLs
+and defaults for the other settings. Keep it as a tracked template; put actual
+runtime configuration in the untracked `.env`. The app reads the process
+environment through `Settings.from_env()`, not `.env` files; no dotenv
+dependency is needed. Docker Compose loads `.env` into the container environment.
 
 To apply the supplied file in PowerShell (only load files you trust):
 
 ```powershell
-Copy-Item .env.example .env
-# Edit .env before loading it.
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+# Edit .env with real provider URLs before loading it.
 Get-Content .env | ForEach-Object {
     if ($_ -match '^([A-Z_]+)=(.*)$') {
         [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
@@ -50,8 +53,8 @@ Get-Content .env | ForEach-Object {
 For POSIX shells:
 
 ```sh
-cp .env.example .env
-# Edit .env before loading it. Sourcing a file executes shell code; trust the file.
+if [ ! -e .env ]; then cp .env.example .env; fi
+# Edit .env with real provider URLs. Sourcing executes shell code; trust the file.
 set -a
 . ./.env
 set +a
@@ -70,6 +73,109 @@ calls overall, and at most two distinct provider attempts per incoming request.
 Connection/read/write/pool timeouts default to 2/10/5/1 seconds respectively.
 HTTPX uses a pool of 30 connections with 20 keep-alive connections. Redirects,
 environment proxies, and implicit transport retries are disabled.
+
+## Docker
+
+### Prerequisites and environment
+
+Install Docker Engine with the Docker Compose v2 plugin, or Docker Desktop
+using Linux containers. Start the Docker engine before running these commands.
+No host Python installation is required.
+
+Create `.env` from `.env.example` **only if `.env` does not already exist**,
+using the copy command for your shell in the configuration section above. Edit
+`.env` with actual provider endpoint URLs and desired concurrency/timeouts.
+The template's `example.com` URLs are placeholders, not working providers.
+Existing environment files are not renamed or overwritten. `.env` is ignored
+by Git and Docker; it is never copied into the image. `.env.example` stays tracked.
+
+Compose uses `env_file: .env` to supply runtime variables. It explicitly
+overrides `DATABASE_URL` with `sqlite:////data/gateway.db` so even a local
+relative path in `.env` cannot place the container's database outside the volume.
+Keep this override unless you also change the volume mount to match. Missing
+settings retain application defaults; invalid settings prevent startup.
+
+Provider URLs must be reachable **from the container**. `127.0.0.1` and
+`localhost` refer to the gateway container, not the host. For host-based test
+providers on Docker Desktop, use `host.docker.internal` instead; Linux Engine
+requires separate host networking configuration if you need that arrangement.
+
+### Build, start, and inspect
+
+From the repository root (commands work in both PowerShell and POSIX shells):
+
+```sh
+docker compose build gateway
+docker compose up -d --wait gateway
+docker compose ps
+docker compose logs -f gateway
+```
+
+The API is available at <http://localhost:8000>, with docs at
+<http://localhost:8000/docs>. Port 8000 is published on all host interfaces;
+restrict access with host firewall rules before exposing it beyond a trusted
+network. This Docker setup does not add authentication or TLS.
+
+The image uses official Python 3.14 slim, caches the dependency installation
+layer separately from application code, copies only `requirements.txt` and
+`app/`, and runs as UID/GID 10001. Dependencies come from the unchanged
+`requirements.txt`, including its test tools and existing version ranges.
+Uvicorn runs as the main process with **one worker**, no reload, and lifespan
+enabled. Do not add workers or scale replicas: routing state and concurrency
+limits are process-local. A 30-second stop grace period allows normal request
+draining and the existing HTTPX/database shutdown handlers to run.
+
+The health check uses Python's standard library to GET `/openapi.json` locally.
+It succeeds only on a successful HTTP response after application startup and
+does not call providers or write database rows. It is a gateway liveness check,
+not a provider-availability or ongoing database-writability check. Docker marks
+an unhealthy container but does not restart it solely for being unhealthy.
+
+To safely check the process route without invoking real providers:
+
+```sh
+curl -i -X POST http://localhost:8000/api/v1/process -H "Content-Type: application/json" -d "{}"
+```
+
+Use `curl.exe` in PowerShell. Expect **422** for the missing `payload` and an
+`X-Request-ID` header. Use the API examples above only when real provider calls
+and their possible side effects are intended.
+
+### Stop and rebuild
+
+```sh
+docker compose down
+```
+
+This removes the container and network but retains the database volume. To
+rebuild after code/dependency changes and recreate the service:
+
+```sh
+docker compose build --pull gateway
+docker compose up -d --wait --force-recreate gateway
+```
+
+### SQLite persistence
+
+Compose creates a named volume, `gateway_data` (normally prefixed with the
+Compose project name), mounted at `/data`. The image prepares this directory
+for the non-root user; Docker initializes a new volume with that ownership.
+The existing startup code creates tables in `/data/gateway.db`. Mounting the
+whole directory also persists SQLite's WAL and shared-memory sidecar files.
+Data survives container recreation and ordinary `docker compose down`/`up`.
+Router statistics and cooldowns are intentionally reset on restart.
+
+**Do not run `docker compose down -v` or delete/prune this volume unless you
+intend to delete the database.** Keep the same Compose project name when
+restarting; a different name creates a different volume. The volume contains
+request/provider payloads and must be protected and backed up as sensitive data.
+A volume provides persistence, not backups or schema migrations.
+
+An existing host `gateway.db` is left untouched and is **not** automatically
+imported. If you need to migrate it, stop all writers, take a consistent SQLite
+backup (including committed WAL contents), and restore it into the volume with
+UID/GID 10001 ownership before startup. A bind-mounted host directory instead
+of the named volume also needs write permission for UID/GID 10001.
 
 ## API usage
 
