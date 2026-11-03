@@ -4,10 +4,12 @@ These rules apply to the entire repository.
 
 ## Read before editing
 
-- Read `README.md` and documentation relevant to the current task, then inspect the affected code, callers, tests, and configuration before choosing a change.
+- Read `README.md`, `docs/CHANGELOG.md`, and documentation relevant to the current task, then inspect the affected code, callers, tests, and configuration before choosing a change.
 - Read `docs/ROADMAP.md` for planning tasks. Treat roadmap items as proposals, not permission to implement them; verify claims about current behavior against code and tests.
 - Do not invent endpoints, schema fields, provider behavior, or infrastructure outside the requested scope. Ask when missing requirements would materially change the implementation; use judgment for routine details.
 - Keep README and API documentation consistent with implemented behavior. Preserve unrelated user changes and existing environment files.
+- For every task that adds, modifies, or deletes repository files, update `docs/CHANGELOG.md` under `Unreleased` in the same change. This includes code, tests, configuration, and documentation-only changes.
+- Record one concise entry per logical change under `Added`, `Changed`, `Fixed`, or `Removed`, as appropriate; do not record every save or duplicate an entry for the changelog update itself. Preserve existing entries and release history.
 
 ## Codebase Memory MCP
 
