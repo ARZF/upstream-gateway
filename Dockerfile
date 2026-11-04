@@ -9,11 +9,11 @@ COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
 RUN groupadd --gid 10001 gateway \
-    && useradd --uid 10001 --gid gateway --no-create-home --shell /usr/sbin/nologin gateway \
-    && mkdir /data \
-    && chown gateway:gateway /data
+    && useradd --uid 10001 --gid gateway --no-create-home --shell /usr/sbin/nologin gateway
 
 COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 USER gateway:gateway
 

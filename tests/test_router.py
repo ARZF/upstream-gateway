@@ -118,14 +118,17 @@ def test_retry_after_parsing(value, expected):
 def test_configuration_from_environment(monkeypatch):
     monkeypatch.setenv("MAX_ATTEMPTS", "3")
     monkeypatch.setenv("RETRY_AMBIGUOUS_FAILURES", "true")
+    monkeypatch.setenv("DATABASE_POOL_SIZE", "7")
     assert Settings.from_env().max_attempts == 3
     assert Settings.from_env().retry_ambiguous_failures
+    assert Settings.from_env().database_pool_size == 7
 
 
 @pytest.mark.parametrize("values", [
     {"max_attempts": 4}, {"provider_a_concurrency": 0},
     {"connect_timeout_seconds": -1}, {"read_timeout_seconds": float("inf")},
     {"http_max_connections": 1, "http_max_keepalive_connections": 2},
+    {"database_pool_size": 0}, {"database_max_overflow": -1},
     {"provider_a_url": "file:///unsafe"},
 ])
 def test_invalid_configuration(values):

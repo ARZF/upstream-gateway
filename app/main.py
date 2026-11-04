@@ -28,7 +28,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         configure_logging()
-        database = Database(config.database_url)
+        database = Database(
+            config.database_url,
+            pool_size=config.database_pool_size,
+            max_overflow=config.database_max_overflow,
+            pool_timeout=config.database_pool_timeout_seconds,
+        )
         try:
             await run_in_threadpool(database.initialize)
             async with httpx.AsyncClient(

@@ -2,7 +2,7 @@
 
 A Python 3.14+ FastAPI backend that forwards `POST /api/v1/process` to one of
 three existing HTTP providers. It records metadata for successful and failed
-validated requests in SQLite. There are no provider implementations or live
+validated requests in PostgreSQL. There are no provider implementations or live
 provider health probes in this project.
 
 ## Install and run
@@ -12,6 +12,7 @@ Windows PowerShell:
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
@@ -20,12 +21,16 @@ Linux/macOS with Python 3.14+:
 ```sh
 python3.14 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m alembic upgrade head
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-SQLite tables are created at startup in `gateway.db`. The shared HTTP client
-and database engine are closed during shutdown. Invalid configuration or
-database initialization errors prevent startup. Interactive API docs are at
+These host commands require `DATABASE_URL` to point to a running PostgreSQL
+server; change the Compose hostname `postgres` in `.env.example` to `localhost`
+when appropriate. Alembic creates and upgrades the schema explicitly. The app
+does not alter PostgreSQL schemas at startup. The shared HTTP client and database
+engine are closed during shutdown. Invalid configuration, unavailable databases,
+or missing migrations prevent startup. Interactive API docs are at
 <http://127.0.0.1:8000/docs>.
 
 ## Configuration
@@ -36,6 +41,12 @@ and defaults for the other settings. Keep it as a tracked template; put actual
 runtime configuration in the untracked `.env`. The app reads the process
 environment through `Settings.from_env()`, not `.env` files; no dotenv
 dependency is needed. Docker Compose loads `.env` into the container environment.
+
+PostgreSQL requires `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and a
+matching `DATABASE_URL` using the `postgresql+psycopg://` scheme. SQLAlchemy's
+pool defaults to 5 persistent connections, 10 overflow connections, and a
+30-second checkout timeout. Configure these with `DATABASE_POOL_SIZE`,
+`DATABASE_MAX_OVERFLOW`, and `DATABASE_POOL_TIMEOUT_SECONDS`.
 
 To apply the supplied file in PowerShell (only load files you trust):
 
@@ -84,16 +95,17 @@ No host Python installation is required.
 
 Create `.env` from `.env.example` **only if `.env` does not already exist**,
 using the copy command for your shell in the configuration section above. Edit
-`.env` with actual provider endpoint URLs and desired concurrency/timeouts.
+`.env` with a strong PostgreSQL password, a matching psycopg connection URL,
+actual provider endpoint URLs, and desired concurrency/timeouts.
 The template's `example.com` URLs are placeholders, not working providers.
 Existing environment files are not renamed or overwritten. `.env` is ignored
 by Git and Docker; it is never copied into the image. `.env.example` stays tracked.
 
-Compose uses `env_file: .env` to supply runtime variables. It explicitly
-overrides `DATABASE_URL` with `sqlite:////data/gateway.db` so even a local
-relative path in `.env` cannot place the container's database outside the volume.
-Keep this override unless you also change the volume mount to match. Missing
-settings retain application defaults; invalid settings prevent startup.
+Compose uses `env_file: .env` to supply runtime variables. `DATABASE_URL` must
+use `postgres` as its hostname because that is the Compose database service
+name. Missing settings retain application defaults; invalid settings prevent
+startup. If credentials contain URL-reserved characters, percent-encode them in
+`DATABASE_URL` while keeping their literal values in `POSTGRES_PASSWORD`.
 
 Provider URLs must be reachable **from the container**. `127.0.0.1` and
 `localhost` refer to the gateway container, not the host. For host-based test
@@ -105,8 +117,7 @@ requires separate host networking configuration if you need that arrangement.
 From the repository root (commands work in both PowerShell and POSIX shells):
 
 ```sh
-docker compose build gateway
-docker compose up -d --wait gateway
+docker compose up -d --build --wait
 docker compose ps
 docker compose logs -f gateway
 ```
@@ -116,10 +127,11 @@ The API is available at <http://localhost:8000>, with docs at
 restrict access with host firewall rules before exposing it beyond a trusted
 network. This Docker setup does not add authentication or TLS.
 
-The image uses official Python 3.14 slim, caches the dependency installation
-layer separately from application code, copies only `requirements.txt` and
-`app/`, and runs as UID/GID 10001. Dependencies come from the unchanged
-`requirements.txt`, including its test tools and existing version ranges.
+The gateway image uses official Python 3.14 slim, caches the dependency
+installation layer separately from application code, and runs as UID/GID 10001.
+PostgreSQL uses the official PostgreSQL 17 image without publishing port 5432.
+The one-shot `migrate` service waits for PostgreSQL health, runs `alembic upgrade
+head`, and must finish successfully before the gateway starts.
 Uvicorn runs as the main process with **one worker**, no reload, and lifespan
 enabled. Do not add workers or scale replicas: routing state and concurrency
 limits are process-local. A 30-second stop grace period allows normal request
@@ -152,31 +164,45 @@ This removes the container and network but retains the database volume. To
 rebuild after code/dependency changes and recreate the service:
 
 ```sh
-docker compose build --pull gateway
-docker compose up -d --wait --force-recreate gateway
+docker compose build --pull gateway migrate
+docker compose up -d --wait --force-recreate
 ```
 
-### SQLite persistence
+### PostgreSQL persistence
 
-Compose creates a named volume, `gateway_data` (normally prefixed with the
-Compose project name), mounted at `/data`. The image prepares this directory
-for the non-root user; Docker initializes a new volume with that ownership.
-The existing startup code creates tables in `/data/gateway.db`. Mounting the
-whole directory also persists SQLite's WAL and shared-memory sidecar files.
-Data survives container recreation and ordinary `docker compose down`/`up`.
-Router statistics and cooldowns are intentionally reset on restart.
+Compose creates a named volume, `postgres_data` (normally prefixed with the
+Compose project name), mounted at PostgreSQL's data directory. Data survives
+container recreation and ordinary `docker compose down`/`up`. Router statistics
+and cooldowns are intentionally reset on restart.
 
 **Do not run `docker compose down -v` or delete/prune this volume unless you
 intend to delete the database.** Keep the same Compose project name when
 restarting; a different name creates a different volume. The volume contains
 request/provider payloads and must be protected and backed up as sensitive data.
-A volume provides persistence, not backups or schema migrations.
+A volume provides persistence, not backups.
 
-An existing host `gateway.db` is left untouched and is **not** automatically
-imported. If you need to migrate it, stop all writers, take a consistent SQLite
-backup (including committed WAL contents), and restore it into the volume with
-UID/GID 10001 ownership before startup. A bind-mounted host directory instead
-of the named volume also needs write permission for UID/GID 10001.
+Inspect recent records without publishing PostgreSQL's port:
+
+```sh
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT request_id, processing_status, created_at FROM requests ORDER BY created_at DESC LIMIT 20"'
+```
+
+### Schema migrations
+
+Run migrations before every application deployment:
+
+```sh
+python -m alembic current
+python -m alembic upgrade head
+```
+
+Use the repository virtual environment on host systems as shown above. Compose
+runs the upgrade through its controlled one-shot `migrate` service. The gateway
+never calls `create_all()` for PostgreSQL, so multiple application processes do
+not race to modify schemas. Create future revisions with `python -m alembic
+revision --autogenerate -m "description"` and review generated SQL before use.
+
+Existing SQLite files are left untouched and are not imported into PostgreSQL.
 
 ## API usage
 
@@ -186,14 +212,14 @@ of the named volume also needs write permission for UID/GID 10001.
   application can serve requests. It does not access the database or providers.
 - `GET /ready`: readiness, returns **200** with `{"status":"ready"}` only
   after startup completes, while the shared HTTP client is open, and a
-  read-only query against SQLite's `requests` table succeeds. It returns
+  read-only query against PostgreSQL's `requests` table succeeds. It returns
   **503** with `{"status":"not_ready"}` before initialization, during
   shutdown, or when a required local dependency is unavailable. Database
   checks run in the existing worker thread pool, not on the async event loop.
 
 Both endpoints appear in `/docs` and `/openapi.json`, include `X-Request-ID`,
 and expose no configuration or internal error details. Neither calls upstream
-providers or records probe requests in SQLite. Readiness verifies database
+providers or records probe requests in PostgreSQL. Readiness verifies database
 access and table availability, not write capacity, free disk space, or upstream
 provider availability. Startup failures still prevent Uvicorn from serving.
 
@@ -274,9 +300,10 @@ Failure responses use the same envelope with `status: "failed"` and an
   rule-based scoring. No network calls happen here.
 - `app/clients/provider_client.py`: HTTP calls, JSON validation, error categories,
   and `Retry-After` parsing.
-- `app/db/`: SQLAlchemy 2.x engine, short-lived transactional sessions, and
-  portable JSON/string/date columns. Synchronous SQLite operations run in
-  Starlette's worker thread pool instead of blocking the async event loop.
+- `app/db/`: synchronous SQLAlchemy 2.x engine, bounded PostgreSQL connection
+  pool, short-lived transactional sessions, and portable JSON/string/date
+  columns. Database operations run in Starlette's worker thread pool instead of
+  blocking the async event loop. Alembic owns PostgreSQL schema changes.
 - `app/core/`: validated environment configuration and standard-library JSON
   logging; payloads and raw exception bodies are not logged.
 
@@ -332,8 +359,10 @@ and UTC creation timestamp. Earlier attempts are represented in correlated
 logs and runtime statistics, not separate database rows. Persisted latency is
 measured at the persistence boundary; response latency includes the database
 commit as well. SQLite timestamps are UTC, though SQLite does not preserve the
-timezone marker. WAL mode and a 5-second busy timeout reduce local writer
-contention. No SQLAlchemy session is shared between requests.
+timezone marker. PostgreSQL preserves timezone-aware timestamps. No SQLAlchemy
+session or connection is shared between requests, and checked-in connections are
+validated before reuse. SQLite remains supported for isolated tests, including
+its WAL and busy-timeout configuration.
 
 Logs are JSON events for incoming requests, provider selection, upstream start
 and end, response status, latency, fallback, and errors, correlated by UUID.
@@ -360,6 +389,15 @@ The Uvicorn smoke test starts a real loopback HTTP listener and invokes the
 endpoint with mocked upstreams, checking startup, persistence, and shutdown.
 Tests never contact the real provider servers.
 
+An optional PostgreSQL integration test exercises Alembic, application startup,
+JSON persistence, timezone-aware timestamps, and cleanup in a temporary schema.
+It only runs when `TEST_DATABASE_URL` names a PostgreSQL database ending in
+`_test`:
+
+```sh
+TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/upstream_gateway_test python -m pytest -q -m postgres
+```
+
 ## Initial-version limits
 
 - Run **one worker**. Runtime health/statistics/semaphores are process-local;
@@ -369,9 +407,9 @@ Tests never contact the real provider servers.
   TLS, incoming body/traffic limits, retention, and access controls before
   internet exposure. The supplied provider URLs use unencrypted HTTP; do not
   send sensitive production data without a secure provider connection.
-- SQLite and `create_all()` are local-development choices. A PostgreSQL move
-  requires a PostgreSQL driver, a connection URL, and schema migrations; the
-  model does not depend on SQLite-specific column types.
+- PostgreSQL makes request history shareable, but router statistics, cooldowns,
+  semaphores, and concurrency limits remain process-local. Keep one Uvicorn
+  worker and one gateway replica until routing state and admission are shared.
 - An HTTP read timeout bounds individual read inactivity, not total duration of
   a continuously streaming response. No total deadline or response-size cap
   is implemented; add those before accepting untrusted/large upstream bodies.
