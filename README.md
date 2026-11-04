@@ -288,6 +288,13 @@ Failure responses use the same envelope with `status: "failed"` and an
 - 500: metadata storage failed. The response explicitly warns that the provider
   may already have processed the request. Do not automatically resubmit it.
 
+## System flow
+
+![Upstream Gateway system components and end-to-end data flow](docs/diagrams/upstream-gateway-architecture.svg)
+
+The editable diagram source is
+[`docs/diagrams/upstream-gateway-architecture.html`](docs/diagrams/upstream-gateway-architecture.html).
+
 ## Architecture and decisions
 
 - `app/main.py`: application factory, request IDs/logging middleware, lifespan,
