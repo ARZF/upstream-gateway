@@ -12,11 +12,22 @@ from app.services.smart_router import NoProviderAvailable, SmartRouter
 
 
 @dataclass
+class AttemptRecord:
+    attempt_number: int
+    provider: str
+    upstream_status_code: int | None
+    latency_ms: float
+    success: bool
+    error_code: str | None
+
+
+@dataclass
 class ProcessingResult:
     response: ProcessResponse
     http_status: int
     upstream_status: int | None
     attempt_count: int
+    attempts: list[AttemptRecord]
 
 
 class ProviderService:
@@ -35,7 +46,8 @@ class ProviderService:
         result_payload = None
         http_status = 503
         success = False
-        attempts = 0
+        attempt_count = 0
+        attempt_records: list[AttemptRecord] = []
 
         deadline = asyncio.timeout(self.router.settings.total_deadline_seconds)
         try:
@@ -53,7 +65,7 @@ class ProviderService:
 
                     selected = provider.name
                     excluded.add(selected)
-                    attempts += 1
+                    attempt_count += 1
                     upstream_status = None
                     log_event(
                         "provider_selected", request_id=request_id,
@@ -61,7 +73,7 @@ class ProviderService:
                     )
                     log_event(
                         "upstream_start", request_id=request_id,
-                        provider=selected, attempt=attempts,
+                        provider=selected, attempt=attempt_count,
                     )
                     attempt_started = perf_counter()
                     error = None
@@ -107,6 +119,17 @@ class ProviderService:
                             error=error,
                         )
                         self.router.release(provider)
+                        attempt_records.append(AttemptRecord(
+                            attempt_number=attempt_count,
+                            provider=selected,
+                            upstream_status_code=upstream_status,
+                            latency_ms=latency,
+                            success=attempt_success,
+                            error_code=(
+                                error.code if error is not None
+                                else None if attempt_success else "interrupted"
+                            ),
+                        ))
                         log_event(
                             "upstream_end", request_id=request_id,
                             provider=selected, status_code=upstream_status,
@@ -122,12 +145,13 @@ class ProviderService:
                             error.ambiguous
                             and not self.router.settings.retry_ambiguous_failures
                         )
-                        or attempts >= self.router.settings.max_attempts
+                        or attempt_count >= self.router.settings.max_attempts
                     ):
                         break
                     log_event(
                         "fallback", request_id=request_id,
-                        failed_provider=selected, next_attempt=attempts + 1,
+                        failed_provider=selected,
+                        next_attempt=attempt_count + 1,
                         reason=error.code,
                     )
         except TimeoutError:
@@ -150,5 +174,5 @@ class ProviderService:
                 error=last_error,
             ),
             http_status=http_status, upstream_status=upstream_status,
-            attempt_count=attempts,
+            attempt_count=attempt_count, attempts=attempt_records,
         )

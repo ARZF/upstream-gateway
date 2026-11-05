@@ -15,7 +15,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.database import Database
-from app.db.models import RequestRecord
+from app.db.models import ProviderAttempt, RequestRecord
 from app.main import create_app
 
 
@@ -65,6 +65,18 @@ def get_record(app, request_id):
         assert record is not None
         session.expunge(record)
         return record
+
+
+def get_attempts(app, request_id):
+    with Session(app.state.database.engine) as session:
+        attempts = session.scalars(
+            select(ProviderAttempt)
+            .where(ProviderAttempt.request_id == request_id)
+            .order_by(ProviderAttempt.attempt_number)
+        ).all()
+        for attempt in attempts:
+            session.expunge(attempt)
+        return attempts
 
 
 @pytest.mark.asyncio
@@ -205,6 +217,13 @@ async def test_success_and_persistence(open_api, caplog):
         assert record.created_at is not None
         assert record.error_details is None
         assert record.attempt_count == 1
+        attempts = get_attempts(app, data["request_id"])
+        assert len(attempts) == record.attempt_count
+        assert attempts[0].attempt_number == 1
+        assert attempts[0].provider == "a"
+        assert attempts[0].success
+        assert attempts[0].error_code is None
+        assert attempts[0].upstream_status_code == 200
         assert app.state.smart_router.providers["a"].successful_requests == 1
         assert len(calls) == 1
         assert "not-in-logs" not in caplog.text
@@ -392,6 +411,10 @@ async def test_total_deadline_persists_failure_and_releases_capacity(open_api):
         assert record.attempt_count == 1
         assert record.upstream_http_status_code is None
         assert record.error_details["code"] == "deadline_exceeded"
+        attempts = get_attempts(app, response.json()["request_id"])
+        assert len(attempts) == record.attempt_count
+        assert attempts[0].error_code == "interrupted"
+        assert not attempts[0].success
         provider = app.state.smart_router.providers["a"]
         assert provider.active_requests == 0
         assert not provider.semaphore.locked()
@@ -422,6 +445,11 @@ async def test_total_deadline_is_shared_across_fallback_attempts(open_api):
         record = get_record(app, response.json()["request_id"])
         assert record.attempt_count == 2
         assert record.processing_status == "failed"
+        attempts = get_attempts(app, response.json()["request_id"])
+        assert len(attempts) == record.attempt_count
+        assert [attempt.error_code for attempt in attempts] == [
+            "connection_error", "interrupted",
+        ]
         for provider in app.state.smart_router.providers.values():
             assert provider.active_requests == 0
             assert not provider.semaphore.locked()
@@ -454,6 +482,19 @@ async def test_fallback(open_api, kind):
         assert record.selected_provider == "b"
         assert record.attempt_count == 2
         assert record.error_details is None
+        attempts = get_attempts(app, response.json()["request_id"])
+        assert len(attempts) == record.attempt_count
+        if kind == "connection":
+            assert attempts[0].attempt_number == 1
+            assert attempts[0].provider == "a"
+            assert not attempts[0].success
+            assert attempts[0].error_code == "connection_error"
+            assert attempts[0].upstream_status_code is None
+            assert attempts[1].attempt_number == 2
+            assert attempts[1].provider == "b"
+            assert attempts[1].success
+            assert attempts[1].error_code is None
+            assert attempts[1].upstream_status_code == 200
         assert app.state.smart_router.providers["a"].failed_requests == 1
         assert app.state.smart_router.providers["b"].successful_requests == 1
 
@@ -528,6 +569,7 @@ async def test_no_available_providers_persisted(open_api):
         assert record.selected_provider is None
         assert record.attempt_count == 0
         assert record.http_status_code == 503
+        assert get_attempts(app, response.json()["request_id"]) == []
 
 
 @pytest.mark.asyncio
@@ -617,16 +659,78 @@ async def test_nonnumeric_content_length_is_handled(open_api):
 
 
 @pytest.mark.asyncio
-async def test_database_failure_is_explicit(open_api, monkeypatch):
-    def save(_):
+async def test_pending_insert_failure_does_not_call_provider(
+    open_api, monkeypatch
+):
+    def create_pending(_):
         raise OperationalError("insert", {}, Exception("mock disk failure"))
 
-    async with open_api(lambda _: httpx.Response(200, json={})) as (app, client):
-        monkeypatch.setattr(app.state.database, "save", save)
-        response = await client.post("/api/v1/process", json={"payload": {}})
+    def handler(_):
+        pytest.fail("The provider must not be called when persistence is down")
+
+    async with open_api(handler) as (app, client):
+        monkeypatch.setattr(
+            app.state.database, "create_pending", create_pending
+        )
+        response = await client.post(
+            "/api/v1/process", json={"payload": {"original": True}}
+        )
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "persistence_unavailable"
+        UUID(response.headers["X-Request-ID"])
+        with Session(app.state.database.engine) as session:
+            assert session.scalar(
+                select(func.count()).select_from(RequestRecord)
+            ) == 0
+
+
+@pytest.mark.asyncio
+async def test_database_failure_is_explicit(open_api, monkeypatch):
+    def complete(*_):
+        raise OperationalError("update", {}, Exception("mock disk failure"))
+
+    payload = {"original": True}
+    async with open_api(
+        lambda _: httpx.Response(200, json={})
+    ) as (app, client):
+        monkeypatch.setattr(app.state.database, "complete", complete)
+        response = await client.post(
+            "/api/v1/process", json={"payload": payload}
+        )
         assert response.status_code == 500
         assert response.json()["error"]["code"] == "persistence_error"
         assert "may have processed" in response.json()["error"]["message"]
+        record = get_record(app, response.json()["request_id"])
+        assert record.processing_status == "pending"
+        assert record.request_payload == payload
+        assert record.http_status_code is None
+        assert record.attempt_count is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_leaves_pending_request(open_api):
+    entered = asyncio.Event()
+
+    async def handler(_):
+        entered.set()
+        await asyncio.Event().wait()
+
+    async with open_api(handler) as (app, client):
+        task = asyncio.create_task(
+            client.post("/api/v1/process", json={"payload": {"cancel": True}})
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with Session(app.state.database.engine) as session:
+            records = session.scalars(select(RequestRecord)).all()
+            assert len(records) == 1
+            assert records[0].processing_status == "pending"
+            assert records[0].request_payload == {"cancel": True}
+            assert session.scalar(
+                select(func.count()).select_from(ProviderAttempt)
+            ) == 0
 
 
 @pytest.mark.asyncio

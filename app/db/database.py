@@ -2,10 +2,11 @@ from typing import Any
 
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.db.models import Base, RequestRecord
+from app.db.models import Base, ProviderAttempt, RequestRecord
 
 
 class Database:
@@ -40,6 +41,7 @@ class Database:
     @staticmethod
     def _configure_sqlite(connection: Any, _record: Any) -> None:
         cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 
@@ -53,9 +55,31 @@ class Database:
         with self.engine.connect() as connection:
             connection.execute(select(1).select_from(RequestRecord).limit(1))
 
-    def save(self, record: RequestRecord) -> None:
+    def create_pending(self, record: RequestRecord) -> None:
         with Session(self.engine) as session, session.begin():
             session.add(record)
+
+    def complete(
+        self, request_id: str, values: dict[str, Any], attempts: list[Any]
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            record = session.get(RequestRecord, request_id)
+            if record is None:
+                raise SQLAlchemyError("Pending request record was not found")
+            for name, value in values.items():
+                setattr(record, name, value)
+            session.add_all([
+                ProviderAttempt(
+                    request_id=request_id,
+                    attempt_number=attempt.attempt_number,
+                    provider=attempt.provider,
+                    upstream_status_code=attempt.upstream_status_code,
+                    latency_ms=attempt.latency_ms,
+                    success=attempt.success,
+                    error_code=attempt.error_code,
+                )
+                for attempt in attempts
+            ])
 
     def close(self) -> None:
         self.engine.dispose()

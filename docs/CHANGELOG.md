@@ -10,6 +10,7 @@
 - Added an index on request creation time and documented external retention.
 - Added regression tests for mid-body transport failures and shared deadlines.
 - Added a GitHub Actions test workflow backed by PostgreSQL 17.
+- Added pending request records and durable per-provider attempt history.
 
 ### Changed
 
@@ -22,6 +23,8 @@
 - Changed provider identifier columns to unbounded text.
 - Split and pinned direct runtime and development dependencies; shortcut: direct pins only, add a lock file or constraints when reproducibility of transitive packages matters.
 - Updated `AGENTS.md` for PostgreSQL runtime persistence and editable pre-data initial migrations.
+- Changed persistence to bracket provider calls with pending and completion transactions.
+- Made request outcome columns nullable and return 503 when pending persistence is unavailable.
 
 ### Removed
 

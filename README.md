@@ -186,6 +186,12 @@ Inspect recent records without publishing PostgreSQL's port:
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT request_id, processing_status, created_at FROM requests ORDER BY created_at DESC LIMIT 20"'
 ```
 
+Find requests left pending for more than one hour:
+
+```sql
+SELECT request_id, created_at FROM requests WHERE processing_status = 'pending' AND created_at < now() - interval '1 hour';
+```
+
 ### Data retention
 
 Choose a retention period based on operational and legal needs; 30 days is an
@@ -197,8 +203,9 @@ docker compose exec postgres psql -U gateway -d upstream_gateway -c "DELETE FROM
 ```
 
 Adjust the database user, database name, and period for the deployment. Request
-and provider payloads are sensitive. PostgreSQL autovacuum, or a planned manual
-`VACUUM`, reclaims space after deletion.
+and provider payloads are sensitive. Deleting a request also deletes its provider
+attempts through the foreign-key cascade. PostgreSQL autovacuum, or a planned
+manual `VACUUM`, reclaims space after deletion.
 
 ### Schema migrations
 
@@ -290,7 +297,8 @@ to providers as `X-Request-ID`, but this is **not** an idempotency guarantee.
 Failure responses use the same envelope with `status: "failed"` and an
 `error` object containing `code` and a safe message:
 
-- 503: no eligible provider, exhausted capacity, or upstream rate limiting.
+- 503: no eligible provider, exhausted capacity, upstream rate limiting, or
+  persistence unavailable before any provider call (`persistence_unavailable`).
 - 504: upstream read/write timeout or total provider-attempt deadline exceeded.
 - 502: connection/transport failure, upstream 5xx, invalid successful JSON,
   oversized upstream response, or unexpected redirect. Redirects are not
@@ -315,8 +323,8 @@ The editable diagram source is
 
 - `app/main.py`: application factory, request IDs/logging middleware, lifespan,
   one pooled `httpx.AsyncClient`, and dependency wiring.
-- `app/api/routes.py`: validates the request, invokes the service, persists the
-  outcome, and serializes the public response.
+- `app/api/routes.py`: validates the request, creates a pending row, invokes the
+  service, completes persistence, and serializes the public response.
 - `app/services/provider_service.py`: bounded attempt loop, status translation,
   per-attempt logging, runtime updates, and guaranteed capacity release.
 - `app/services/smart_router.py`: process-local runtime state, admission, and
@@ -376,17 +384,21 @@ it falls back or receives 503. Non-retryable 4xx do not trigger a cooldown.
 
 ### Persistence and logging
 
-One database row stores the final attempted provider, request payload, final
-provider JSON, optional transaction/provider request IDs, gateway and upstream
-HTTP statuses, processing status, latency, safe error details, attempt count,
-and UTC creation timestamp. Earlier attempts are represented in correlated
-logs and runtime statistics, not separate database rows. Persisted latency is
-measured at the persistence boundary; response latency includes the database
-commit as well. SQLite timestamps are UTC, though SQLite does not preserve the
-timezone marker. PostgreSQL preserves timezone-aware timestamps. No SQLAlchemy
-session or connection is shared between requests, and checked-in connections are
-validated before reuse. SQLite remains supported for isolated tests, including
-its WAL and busy-timeout configuration.
+After validation, one transaction inserts a `pending` request before any provider
+call. A second transaction completes the request outcome and inserts one
+`provider_attempts` row per attempted provider. This keeps fallback history and
+ensures that completion is all-or-nothing. Persisted latency is measured from
+route start to the completion boundary; response latency also includes the final
+database commit. This costs two database transactions per request and should be
+measured by the future load test.
+
+The requests row stores the payload, final provider response and identifiers,
+gateway and upstream statuses, processing status, latency, safe error details,
+attempt count, and UTC creation time. SQLite timestamps are UTC, though SQLite
+does not preserve the timezone marker. PostgreSQL preserves timezone-aware
+timestamps. No SQLAlchemy session or connection is shared between requests, and
+checked-in connections are validated before reuse. SQLite remains supported for
+isolated tests, including its WAL, foreign keys, and busy-timeout configuration.
 
 Logs are JSON events for incoming requests, provider selection, upstream start
 and end, response status, latency, fallback, and errors, correlated by UUID.
@@ -441,9 +453,9 @@ TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/upstream_gat
   response bodies are stream-counted against a configurable cap. Incoming body
   limits rely on `Content-Length`; chunked uploads must be capped by a reverse
   proxy or a future stream-counting implementation before public exposure.
-- Upstream side effects and local persistence cannot be atomic. Cancellation,
-  a crash, or a failed commit after a provider call can leave an external effect
-  without a database record. Durable intake/idempotency is needed for stronger
-  guarantees. This version does not claim exactly-once processing.
+- Upstream side effects and completion cannot be atomic. Cancellation or a crash
+  leaves the durable request row pending, and a failed completion transaction
+  also leaves it pending. A reaper or reconciliation job is still needed for
+  automatic resolution. This version does not claim exactly-once processing.
 - No distributed infrastructure, background health polling, tracing, metrics
   endpoints, or additional public business endpoints are included.

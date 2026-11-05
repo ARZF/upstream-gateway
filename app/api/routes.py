@@ -70,32 +70,61 @@ async def process(
 ) -> JSONResponse:
     started = perf_counter()
     request_id = request.state.request_id
+    pending = RequestRecord(
+        request_id=request_id,
+        request_payload=body.payload,
+        processing_status="pending",
+    )
+    try:
+        await run_in_threadpool(database.create_pending, pending)
+    except SQLAlchemyError:
+        log_event(
+            "persistence_error", level=logging.ERROR, request_id=request_id
+        )
+        response = ProcessResponse(
+            request_id=request_id, provider=None, status="failed",
+            latency_ms=(perf_counter() - started) * 1000,
+            error=ErrorDetails(
+                code="persistence_unavailable",
+                message=("The request could not be recorded; "
+                         "the provider was not called"),
+            ),
+        )
+        return JSONResponse(
+            status_code=503, content=response.model_dump(mode="json")
+        )
+
+    # shortcut: cancelled or crashed requests leave a pending row, add a reaper or reconciliation job when these need automatic resolution.
     outcome = await service.process(body.payload, request_id)
     response = outcome.response
     provider_payload = response.result
     identifiers = (
         provider_payload if isinstance(provider_payload, dict) else {}
     )
-    record = RequestRecord(
-        request_id=request_id, selected_provider=response.provider,
-        request_payload=body.payload, provider_response=provider_payload,
-        provider_transaction_id=(
+    values = {
+        "selected_provider": response.provider,
+        "provider_response": provider_payload,
+        "provider_transaction_id": (
             identifiers.get("id")
             if isinstance(identifiers.get("id"), str) else None
         ),
-        provider_request_id=(
+        "provider_request_id": (
             identifiers.get("request_id")
             if isinstance(identifiers.get("request_id"), str) else None
         ),
-        http_status_code=outcome.http_status,
-        upstream_http_status_code=outcome.upstream_status,
-        processing_status=response.status,
-        total_latency_ms=(perf_counter() - started) * 1000,
-        error_details=response.error.model_dump() if response.error else None,
-        attempt_count=outcome.attempt_count,
-    )
+        "http_status_code": outcome.http_status,
+        "upstream_http_status_code": outcome.upstream_status,
+        "processing_status": response.status,
+        "total_latency_ms": (perf_counter() - started) * 1000,
+        "error_details": (
+            response.error.model_dump() if response.error else None
+        ),
+        "attempt_count": outcome.attempt_count,
+    }
     try:
-        await run_in_threadpool(database.save, record)
+        await run_in_threadpool(
+            database.complete, request_id, values, outcome.attempts
+        )
     except SQLAlchemyError:
         log_event(
             "persistence_error", level=logging.ERROR, request_id=request_id

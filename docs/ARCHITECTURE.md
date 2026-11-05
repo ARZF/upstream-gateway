@@ -28,11 +28,17 @@ SQLite connections receive `check_same_thread`, busy-timeout, WAL, and in-memory
 
 ## Persistence boundary
 
-One `requests` row records the final request outcome. JSON payload/response
-columns remain SQLAlchemy `JSON`, and `created_at` remains a timezone-aware UTC
-timestamp. PostgreSQL preserves its timezone semantics. Upstream calls and the
-local database transaction cannot be atomic, so a provider side effect can
-exist without a row if persistence fails.
+After validation, the first short transaction inserts a `requests` row with
+`processing_status="pending"` before any provider call. If this insert fails,
+the provider is not called. After routing finishes, a second transaction updates
+the outcome and inserts every `provider_attempts` row, so the final request and
+its attempt history commit together. Deleting a request cascades to its attempts.
+
+Cancellation, a crash, or a failed completion leaves the pending row as a
+durable trace; automatic reconciliation is not implemented. JSON
+payload/response columns remain SQLAlchemy `JSON`, and timestamps remain
+timezone-aware UTC values on PostgreSQL. The two transactions per request keep
+database work explicit but add latency that still needs load testing.
 
 ## Deployment constraints
 
