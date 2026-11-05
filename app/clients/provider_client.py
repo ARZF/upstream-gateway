@@ -56,18 +56,46 @@ def reject_nonfinite(value: str) -> None:
 
 
 class ProviderClient:
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, max_response_bytes: int
+    ) -> None:
         self.client = client
+        self.max_response_bytes = max_response_bytes
 
     async def process(
         self, url: str, payload: dict[str, Any], request_id: str
     ) -> UpstreamResult:
         try:
-            # shortcut: no body cap, add streaming limits for untrusted APIs.
-            response = await self.client.post(
-                url, json={"payload": payload},
+            async with self.client.stream(
+                "POST", url, json={"payload": payload},
                 headers={"X-Request-ID": request_id},
-            )
+            ) as response:
+                content_length = response.headers.get("Content-Length")
+                try:
+                    declared_size = (
+                        int(content_length) if content_length is not None else None
+                    )
+                except ValueError:
+                    declared_size = None
+                if (
+                    declared_size is not None
+                    and declared_size > self.max_response_bytes
+                ):
+                    raise ProviderError(
+                        "response_too_large",
+                        "The provider response exceeded the size limit",
+                        retryable=False, status_code=response.status_code,
+                    )
+
+                content = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(content) + len(chunk) > self.max_response_bytes:
+                        raise ProviderError(
+                            "response_too_large",
+                            "The provider response exceeded the size limit",
+                            retryable=False, status_code=response.status_code,
+                        )
+                    content.extend(chunk)
         except (
             httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout
         ) as exc:
@@ -88,7 +116,7 @@ class ProviderClient:
 
         try:
             data = json.loads(
-                response.content, parse_constant=reject_nonfinite
+                content, parse_constant=reject_nonfinite
             )
             json.dumps(data, allow_nan=False)
         except (ValueError, UnicodeDecodeError):

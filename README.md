@@ -82,6 +82,9 @@ The defaults allow 10 concurrent calls per provider, 20 concurrent upstream
 calls overall, and at most two distinct provider attempts per incoming request.
 `MAX_ATTEMPTS=1` disables fallback, and the maximum permitted value is 3.
 Connection/read/write/pool timeouts default to 2/10/5/1 seconds respectively.
+All provider attempts share a 15-second total deadline. Incoming request bodies
+and upstream response bodies default to a 1 MiB limit; the incoming limit checks
+`Content-Length`, while the response limit is enforced during streaming.
 HTTPX uses a pool of 30 connections with 20 keep-alive connections. Redirects,
 environment proxies, and implicit transport retries are disabled.
 
@@ -278,9 +281,12 @@ Failure responses use the same envelope with `status: "failed"` and an
 `error` object containing `code` and a safe message:
 
 - 503: no eligible provider, exhausted capacity, or upstream rate limiting.
-- 504: upstream read/write timeout.
+- 504: upstream read/write timeout or total provider-attempt deadline exceeded.
 - 502: connection/transport failure, upstream 5xx, invalid successful JSON,
-  or unexpected redirect. Redirects are not followed.
+  oversized upstream response, or unexpected redirect. Redirects are not
+  followed.
+- 413: declared incoming request body exceeds the configured limit; it is
+  rejected before validation, provider calls, or persistence.
 - Other upstream 4xx: forwarded status with the JSON error body in `result`,
   without fallback. Validation failures at the gateway use FastAPI's normal
   422 `detail` response (without echoing invalid input) and do not create
@@ -412,15 +418,16 @@ TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/upstream_gat
   multiple workers or replicas would multiply the configured limits. Shared
   admission/routing state is needed before scaling that way.
 - This is a local backend, not an authenticated public API. Add authentication,
-  TLS, incoming body/traffic limits, retention, and access controls before
-  internet exposure. The supplied provider URLs use unencrypted HTTP; do not
-  send sensitive production data without a secure provider connection.
+  TLS, chunked-upload enforcement, traffic limits, retention, and access controls
+  before internet exposure. The supplied provider URLs use unencrypted HTTP; do
+  not send sensitive production data without a secure provider connection.
 - PostgreSQL makes request history shareable, but router statistics, cooldowns,
   semaphores, and concurrency limits remain process-local. Keep one Uvicorn
   worker and one gateway replica until routing state and admission are shared.
-- An HTTP read timeout bounds individual read inactivity, not total duration of
-  a continuously streaming response. No total deadline or response-size cap
-  is implemented; add those before accepting untrusted/large upstream bodies.
+- A configurable total deadline bounds all provider attempts, and upstream
+  response bodies are stream-counted against a configurable cap. Incoming body
+  limits rely on `Content-Length`; chunked uploads must be capped by a reverse
+  proxy or a future stream-counting implementation before public exposure.
 - Upstream side effects and local persistence cannot be atomic. Cancellation,
   a crash, or a failed commit after a provider call can leave an external effect
   without a database record. Durable intake/idempotency is needed for stronger

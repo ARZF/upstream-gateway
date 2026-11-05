@@ -20,6 +20,18 @@ from app.db.models import RequestRecord
 from app.main import create_app
 
 
+class MockResponseStream(httpx.AsyncByteStream):
+    def __init__(self, *chunks, readable=True):
+        self.chunks = chunks
+        self.readable = readable
+
+    async def __aiter__(self):
+        if not self.readable:
+            pytest.fail("Response body must not be read")
+        for chunk in self.chunks:
+            yield chunk
+
+
 @pytest.fixture
 def open_api(tmp_path):
     @asynccontextmanager
@@ -223,6 +235,54 @@ async def test_preserves_variable_json_response(open_api, provider_payload):
 
 
 @pytest.mark.asyncio
+async def test_response_size_limit_stops_streaming_without_fallback(open_api):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.host)
+        return httpx.Response(
+            200, stream=MockResponseStream(b'{"value":"', b"x" * 32, b'"}')
+        )
+
+    async with open_api(
+        handler, max_response_bytes=24, retry_ambiguous_failures=True
+    ) as (app, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "response_too_large"
+        assert calls == ["provider-a"]
+        assert get_record(app, response.json()["request_id"]).upstream_http_status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_response_size_limit_rejects_large_content_length_early(open_api):
+    def handler(_):
+        return httpx.Response(
+            200,
+            headers={"Content-Length": "100"},
+            stream=MockResponseStream(readable=False),
+        )
+
+    async with open_api(handler, max_response_bytes=99) as (_, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "response_too_large"
+
+
+@pytest.mark.asyncio
+async def test_response_just_under_size_limit_succeeds(open_api):
+    content = b'{"ok":true}'
+
+    async with open_api(
+        lambda _: httpx.Response(200, content=content),
+        max_response_bytes=len(content) + 1,
+    ) as (_, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 200
+        assert response.json()["result"] == {"ok": True}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind,expected", [("timeout", 504), ("server", 502)])
 async def test_ambiguous_failures_not_retried_by_default(open_api, kind, expected):
     calls = []
@@ -245,6 +305,34 @@ async def test_ambiguous_failures_not_retried_by_default(open_api, kind, expecte
         assert record.processing_status == "failed"
         assert record.http_status_code == expected
         assert record.error_details["code"] == response.json()["error"]["code"]
+
+
+@pytest.mark.asyncio
+async def test_total_deadline_persists_failure_and_releases_capacity(open_api):
+    calls = []
+
+    async def handler(request):
+        calls.append(request.url.host)
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={})
+
+    async with open_api(
+        handler, total_deadline_seconds=0.01,
+        retry_ambiguous_failures=True,
+    ) as (app, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 504
+        assert response.json()["error"]["code"] == "deadline_exceeded"
+        assert calls == ["provider-a"]
+        record = get_record(app, response.json()["request_id"])
+        assert record.http_status_code == 504
+        assert record.attempt_count == 1
+        assert record.upstream_http_status_code is None
+        assert record.error_details["code"] == "deadline_exceeded"
+        provider = app.state.smart_router.providers["a"]
+        assert provider.active_requests == 0
+        assert not provider.semaphore.locked()
+        assert not app.state.smart_router.semaphore.locked()
 
 
 @pytest.mark.asyncio
@@ -391,6 +479,48 @@ async def test_invalid_request_has_id_and_no_upstream_call(open_api, body):
         response = await client.post("/api/v1/process", json=body)
         assert response.status_code == 422
         UUID(response.headers["X-Request-ID"])
+
+
+@pytest.mark.asyncio
+async def test_request_size_limit_rejects_before_parsing_or_persistence(open_api):
+    calls = []
+
+    def handler(_):
+        calls.append(True)
+        return httpx.Response(200, json={})
+
+    async with open_api(handler, max_request_body_bytes=32) as (app, client):
+        response = await client.post(
+            "/api/v1/process",
+            json={"payload": {"value": "x" * 32}},
+        )
+        assert response.status_code == 413
+        UUID(response.headers["X-Request-ID"])
+        assert response.json()["error"]["code"] == "request_too_large"
+        assert calls == []
+        with Session(app.state.database.engine) as session:
+            assert session.scalar(
+                select(func.count()).select_from(RequestRecord)
+            ) == 0
+
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 200
+        assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_nonnumeric_content_length_is_handled(open_api):
+    async with open_api(
+        lambda _: httpx.Response(200, json={})
+    ) as (_, client):
+        response = await client.post(
+            "/api/v1/process", content=b'{"payload":{}}',
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "invalid",
+            },
+        )
+        assert response.status_code == 200
 
 
 @pytest.mark.asyncio

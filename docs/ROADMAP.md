@@ -49,8 +49,8 @@ Note: Exact cooldown duration and concurrency limits still require dedicated aut
 
 Priority: High
 
-- [ ] Implement an overall request deadline.
-- [ ] Add request and response body size limits.
+- [x] Implement an overall request deadline.
+- [x] Add request and response body size limits.
 - [ ] Review retry behavior for ambiguous failures.
 - [ ] Improve timeout and cancellation handling.
 - [ ] Add automated tests for cooldown expiration.
@@ -101,7 +101,8 @@ The current implementation has several limitations that must be considered befor
 - PostgreSQL is used for persistence; schema changes require Alembic migrations.
 - Authentication is not implemented.
 - Public deployment requires additional security controls.
-- Total request deadline and response size limits need implementation.
+- Incoming request limits rely on `Content-Length`; chunked uploads require a
+  reverse-proxy limit or stream counting.
 
 ## 5. Development Principles
 

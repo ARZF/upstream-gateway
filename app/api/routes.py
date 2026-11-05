@@ -57,6 +57,7 @@ async def ready(request: Request) -> JSONResponse:
 @router.post(
     "/api/v1/process", response_model=ProcessResponse,
     responses={
+        413: {"model": ProcessResponse},
         500: {"model": ProcessResponse},
         502: {"model": ProcessResponse}, 503: {"model": ProcessResponse},
         504: {"model": ProcessResponse},

@@ -23,6 +23,9 @@ class Settings(BaseModel):
     read_timeout_seconds: float = Field(default=10.0, gt=0)
     write_timeout_seconds: float = Field(default=5.0, gt=0)
     pool_timeout_seconds: float = Field(default=1.0, gt=0)
+    total_deadline_seconds: float = Field(default=15.0, gt=0)
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1)
+    max_response_bytes: int = Field(default=1_048_576, ge=1)
     max_attempts: int = Field(default=2, ge=1, le=3)
     retry_ambiguous_failures: bool = False
     failure_cooldown_seconds: float = Field(default=5.0, gt=0)

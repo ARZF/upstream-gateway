@@ -15,6 +15,7 @@ from app.clients.provider_client import ProviderClient
 from app.core.config import Settings
 from app.core.logging import configure_logging, log_event
 from app.db.database import Database
+from app.schemas.request import ErrorDetails, ProcessResponse
 from app.services.provider_service import ProviderService
 from app.services.smart_router import SmartRouter
 
@@ -56,7 +57,7 @@ def create_app(
                 application.state.http_client = client
                 application.state.smart_router = smart_router
                 application.state.provider_service = ProviderService(
-                    smart_router, ProviderClient(client)
+                    smart_router, ProviderClient(client, config.max_response_bytes)
                 )
                 application.state.ready = True
                 yield
@@ -95,20 +96,45 @@ def create_app(
             "incoming_request", request_id=request_id,
             method=request.method, path=request.url.path,
         )
+        content_length = request.headers.get("Content-Length")
         try:
-            response = await call_next(request)
-        except Exception as exc:
-            log_event(
-                "request_error", level=logging.ERROR, request_id=request_id,
-                error_type=type(exc).__name__,
+            declared_size = (
+                int(content_length) if content_length is not None else None
             )
-            response = JSONResponse(status_code=500, content={
-                "request_id": request_id,
-                "error": {
-                    "code": "internal_error",
-                    "message": "Internal server error",
-                },
-            })
+        except ValueError:
+            declared_size = None
+        # shortcut: only checks Content-Length, chunked uploads are not capped, enforce at the reverse proxy or stream-count the body when exposed publicly.
+        if (
+            declared_size is not None
+            and declared_size > config.max_request_body_bytes
+        ):
+            body = ProcessResponse(
+                request_id=request_id, provider=None, status="failed",
+                latency_ms=(perf_counter() - started) * 1000,
+                error=ErrorDetails(
+                    code="request_too_large",
+                    message="The request body exceeded the size limit",
+                ),
+            )
+            response = JSONResponse(
+                status_code=413, content=body.model_dump(mode="json")
+            )
+        else:
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                log_event(
+                    "request_error", level=logging.ERROR,
+                    request_id=request_id,
+                    error_type=type(exc).__name__,
+                )
+                response = JSONResponse(status_code=500, content={
+                    "request_id": request_id,
+                    "error": {
+                        "code": "internal_error",
+                        "message": "Internal server error",
+                    },
+                })
         response.headers["X-Request-ID"] = request_id
         log_event(
             "request_end", request_id=request_id,

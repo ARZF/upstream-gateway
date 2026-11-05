@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from time import perf_counter
@@ -36,87 +37,108 @@ class ProviderService:
         success = False
         attempts = 0
 
-        for _ in range(self.router.settings.max_attempts):
-            try:
-                provider = await self.router.acquire(excluded)
-            except NoProviderAvailable as exc:
-                http_status = 503
-                if last_error is None:
-                    last_error = ErrorDetails(
-                        code="unavailable", message=str(exc)
+        deadline = asyncio.timeout(self.router.settings.total_deadline_seconds)
+        try:
+            async with deadline:
+                for _ in range(self.router.settings.max_attempts):
+                    try:
+                        provider = await self.router.acquire(excluded)
+                    except NoProviderAvailable as exc:
+                        http_status = 503
+                        if last_error is None:
+                            last_error = ErrorDetails(
+                                code="unavailable", message=str(exc)
+                            )
+                        break
+
+                    selected = provider.name
+                    excluded.add(selected)
+                    attempts += 1
+                    upstream_status = None
+                    log_event(
+                        "provider_selected", request_id=request_id,
+                        provider=selected,
                     )
-                break
+                    log_event(
+                        "upstream_start", request_id=request_id,
+                        provider=selected, attempt=attempts,
+                    )
+                    attempt_started = perf_counter()
+                    error = None
+                    attempt_success = False
+                    try:
+                        result = await self.client.process(
+                            provider.url, payload, request_id
+                        )
+                        upstream_status = result.status_code
+                        result_payload = result.payload
+                        http_status = 200
+                        success = attempt_success = True
+                        last_error = None
+                    except ProviderError as exc:
+                        error = exc
+                        upstream_status = exc.status_code
+                        result_payload = exc.payload
+                        last_error = ErrorDetails(
+                            code=exc.code, message=str(exc)
+                        )
+                        if exc.code == "response_too_large":
+                            http_status = 502
+                        elif exc.status_code == 429:
+                            http_status = 503
+                        elif (
+                            exc.status_code is not None
+                            and 400 <= exc.status_code < 500
+                        ):
+                            http_status = exc.status_code
+                        elif exc.code == "timeout":
+                            http_status = 504
+                        else:
+                            http_status = 502
+                        log_event(
+                            "upstream_error", level=logging.WARNING,
+                            request_id=request_id, provider=selected,
+                            code=exc.code, status_code=exc.status_code,
+                        )
+                    finally:
+                        latency = (perf_counter() - attempt_started) * 1000
+                        self.router.record(
+                            provider, latency, success=attempt_success,
+                            error=error,
+                        )
+                        self.router.release(provider)
+                        log_event(
+                            "upstream_end", request_id=request_id,
+                            provider=selected, status_code=upstream_status,
+                            latency_ms=round(latency, 3),
+                            success=attempt_success,
+                        )
 
-            selected = provider.name
-            excluded.add(selected)
-            attempts += 1
-            upstream_status = None
-            log_event(
-                "provider_selected", request_id=request_id, provider=selected
-            )
-            log_event(
-                "upstream_start", request_id=request_id,
-                provider=selected, attempt=attempts,
-            )
-            attempt_started = perf_counter()
-            error = None
-            attempt_success = False
-            try:
-                result = await self.client.process(
-                    provider.url, payload, request_id
-                )
-                upstream_status = result.status_code
-                result_payload = result.payload
-                http_status = 200
-                success = attempt_success = True
-                last_error = None
-            except ProviderError as exc:
-                error = exc
-                upstream_status = exc.status_code
-                result_payload = exc.payload
-                last_error = ErrorDetails(code=exc.code, message=str(exc))
-                if exc.status_code == 429:
-                    http_status = 503
-                elif (
-                    exc.status_code is not None
-                    and 400 <= exc.status_code < 500
-                ):
-                    http_status = exc.status_code
-                elif exc.code == "timeout":
-                    http_status = 504
-                else:
-                    http_status = 502
-                log_event(
-                    "upstream_error", level=logging.WARNING,
-                    request_id=request_id, provider=selected,
-                    code=exc.code, status_code=exc.status_code,
-                )
-            finally:
-                latency = (perf_counter() - attempt_started) * 1000
-                self.router.record(
-                    provider, latency, success=attempt_success, error=error
-                )
-                self.router.release(provider)
-                log_event(
-                    "upstream_end", request_id=request_id, provider=selected,
-                    status_code=upstream_status, latency_ms=round(latency, 3),
-                    success=attempt_success,
-                )
-
-            if success:
-                break
-            if (
-                error is None or not error.retryable
-                or (
-                    error.ambiguous
-                    and not self.router.settings.retry_ambiguous_failures
-                )
-                or attempts >= self.router.settings.max_attempts
-            ):
-                break
-            log_event(
-                "fallback", request_id=request_id, failed_provider=selected,
-                next_attempt=attempts + 1, reason=error.code,
+                    if success:
+                        break
+                    if (
+                        error is None or not error.retryable
+                        or (
+                            error.ambiguous
+                            and not self.router.settings.retry_ambiguous_failures
+                        )
+                        or attempts >= self.router.settings.max_attempts
+                    ):
+                        break
+                    log_event(
+                        "fallback", request_id=request_id,
+                        failed_provider=selected, next_attempt=attempts + 1,
+                        reason=error.code,
+                    )
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            http_status = 504
+            success = False
+            result_payload = None
+            last_error = ErrorDetails(
+                code="deadline_exceeded",
+                message="The request exceeded the total processing deadline",
             )
 
         return ProcessingResult(

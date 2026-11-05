@@ -133,7 +133,9 @@ async def test_cancellation_releases_all_capacity():
 
     router = SmartRouter(Settings(max_upstream_concurrency=1, provider_a_concurrency=1))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        service = ProviderService(router, ProviderClient(client))
+        service = ProviderService(
+            router, ProviderClient(client, router.settings.max_response_bytes)
+        )
         task = asyncio.create_task(service.process({}, str(uuid4())))
         await asyncio.wait_for(entered.wait(), 1)
         task.cancel()
@@ -164,6 +166,8 @@ def test_configuration_from_environment(monkeypatch):
     {"connect_timeout_seconds": -1}, {"read_timeout_seconds": float("inf")},
     {"http_max_connections": 1, "http_max_keepalive_connections": 2},
     {"database_pool_size": 0}, {"database_max_overflow": -1},
+    {"total_deadline_seconds": 0}, {"max_request_body_bytes": 0},
+    {"max_response_bytes": 0},
     {"provider_a_url": "file:///unsafe"},
 ])
 def test_invalid_configuration(values):
