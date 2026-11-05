@@ -13,8 +13,8 @@ from app.services.smart_router import NoProviderAvailable, SmartRouter
 
 
 @pytest.mark.asyncio
-async def test_selection_uses_latency_and_error_rate():
-    router = SmartRouter(Settings())
+async def test_selection_uses_latency_and_error_rate(settings_factory):
+    router = SmartRouter(settings_factory())
     a, b, c = router.providers.values()
     router.record(a, 100, success=True)
     router.record(a, 100, success=False)
@@ -34,8 +34,8 @@ async def test_selection_uses_latency_and_error_rate():
 
 
 @pytest.mark.asyncio
-async def test_per_provider_capacity_and_exclusions():
-    router = SmartRouter(Settings(provider_a_concurrency=1))
+async def test_per_provider_capacity_and_exclusions(settings_factory):
+    router = SmartRouter(settings_factory(provider_a_concurrency=1))
     a = await router.acquire(set())
     assert a.name == "a" and a.active_requests == 1
     b = await router.acquire(set())
@@ -50,8 +50,8 @@ async def test_per_provider_capacity_and_exclusions():
 
 
 @pytest.mark.asyncio
-async def test_global_limit_has_no_wait_queue():
-    router = SmartRouter(Settings(max_upstream_concurrency=1))
+async def test_global_limit_has_no_wait_queue(settings_factory):
+    router = SmartRouter(settings_factory(max_upstream_concurrency=1))
     provider = await router.acquire(set())
     with pytest.raises(NoProviderAvailable):
         await asyncio.wait_for(router.acquire(set()), 0.1)
@@ -59,8 +59,8 @@ async def test_global_limit_has_no_wait_queue():
     assert not router.semaphore.locked()
 
 
-def test_bounded_recent_statistics_and_recovery():
-    router = SmartRouter(Settings(stats_window=2))
+def test_bounded_recent_statistics_and_recovery(settings_factory):
+    router = SmartRouter(settings_factory(stats_window=2))
     a = router.providers["a"]
     error = ProviderError("connection_error", "mock", retryable=True)
     router.record(a, 1, success=False, error=error)
@@ -75,8 +75,10 @@ def test_bounded_recent_statistics_and_recovery():
 
 
 @pytest.mark.parametrize("has_success_sample", [False, True])
-def test_client_4xx_does_not_change_provider_score(has_success_sample):
-    router = SmartRouter(Settings())
+def test_client_4xx_does_not_change_provider_score(
+    has_success_sample, settings_factory
+):
+    router = SmartRouter(settings_factory())
     provider = router.providers["a"]
     if has_success_sample:
         router.record(provider, 100, success=True)
@@ -94,8 +96,10 @@ def test_client_4xx_does_not_change_provider_score(has_success_sample):
 
 
 @pytest.mark.parametrize("status", [429, 500])
-def test_rate_limit_and_server_errors_still_count_as_failures(status):
-    router = SmartRouter(Settings())
+def test_rate_limit_and_server_errors_still_count_as_failures(
+    status, settings_factory
+):
+    router = SmartRouter(settings_factory())
     provider = router.providers["a"]
     router.record(provider, 100, success=False, error=ProviderError(
         "rate_limited" if status == 429 else "upstream_server_error",
@@ -109,8 +113,10 @@ def test_rate_limit_and_server_errors_still_count_as_failures(status):
         assert not provider.available
 
 
-def test_rate_limit_is_not_concurrency_or_shortened_by_later_responses():
-    router = SmartRouter(Settings())
+def test_rate_limit_is_not_concurrency_or_shortened_by_later_responses(
+    settings_factory,
+):
+    router = SmartRouter(settings_factory())
     a = router.providers["a"]
     for cooldown in [120, 5]:
         router.record(a, 1, success=False, error=ProviderError(
@@ -124,14 +130,16 @@ def test_rate_limit_is_not_concurrency_or_shortened_by_later_responses():
 
 
 @pytest.mark.asyncio
-async def test_cancellation_releases_all_capacity():
+async def test_cancellation_releases_all_capacity(settings_factory):
     entered = asyncio.Event()
 
     async def handler(_):
         entered.set()
         await asyncio.Event().wait()
 
-    router = SmartRouter(Settings(max_upstream_concurrency=1, provider_a_concurrency=1))
+    router = SmartRouter(settings_factory(
+        max_upstream_concurrency=1, provider_a_concurrency=1,
+    ))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         service = ProviderService(
             router, ProviderClient(client, router.settings.max_response_bytes)
@@ -153,6 +161,9 @@ def test_retry_after_parsing(value, expected):
 
 
 def test_configuration_from_environment(monkeypatch):
+    monkeypatch.setenv("PROVIDER_A_URL", "https://provider-a/v1/process")
+    monkeypatch.setenv("PROVIDER_B_URL", "https://provider-b/v1/process")
+    monkeypatch.setenv("PROVIDER_C_URL", "https://provider-c/v1/process")
     monkeypatch.setenv("MAX_ATTEMPTS", "3")
     monkeypatch.setenv("RETRY_AMBIGUOUS_FAILURES", "true")
     monkeypatch.setenv("DATABASE_POOL_SIZE", "7")
@@ -170,6 +181,30 @@ def test_configuration_from_environment(monkeypatch):
     {"max_response_bytes": 0},
     {"provider_a_url": "file:///unsafe"},
 ])
-def test_invalid_configuration(values):
+def test_invalid_configuration(values, settings_factory):
     with pytest.raises(ValidationError):
-        Settings(**values)
+        settings_factory(**values)
+
+
+def test_provider_urls_are_required():
+    with pytest.raises(ValidationError):
+        Settings(
+            provider_b_url="https://provider-b/v1/process",
+            provider_c_url="https://provider-c/v1/process",
+        )
+
+
+def test_public_http_provider_url_is_rejected(settings_factory):
+    with pytest.raises(ValidationError, match="Provider URLs must use HTTPS"):
+        settings_factory(
+            provider_a_url="http://provider-a.example.com/v1/process"
+        )
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:8001/v1/process",
+    "http://[::1]:8001/v1/process",
+    "https://provider-a.example.com/v1/process",
+])
+def test_secure_provider_urls_are_allowed(settings_factory, url):
+    assert str(settings_factory(provider_a_url=url).provider_a_url) == url

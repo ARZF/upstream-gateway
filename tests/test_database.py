@@ -72,5 +72,8 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch):
         assert set(RequestRecord.__table__.columns.keys()) == {
             column["name"] for column in inspect(engine).get_columns("requests")
         }
+        assert "ix_requests_created_at" in {
+            index["name"] for index in inspect(engine).get_indexes("requests")
+        }
     finally:
         engine.dispose()

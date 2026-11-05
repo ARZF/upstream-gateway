@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -16,8 +16,8 @@ class RequestRecord(Base):
     selected_provider: Mapped[str | None] = mapped_column(String(16))
     request_payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     provider_response: Mapped[Any | None] = mapped_column(JSON, nullable=True)
-    provider_transaction_id: Mapped[str | None] = mapped_column(String(255))
-    provider_request_id: Mapped[str | None] = mapped_column(String(255))
+    provider_transaction_id: Mapped[str | None] = mapped_column(Text)
+    provider_request_id: Mapped[str | None] = mapped_column(Text)
     http_status_code: Mapped[int] = mapped_column(Integer)
     upstream_http_status_code: Mapped[int | None] = mapped_column(Integer)
     processing_status: Mapped[str] = mapped_column(String(32))
@@ -27,5 +27,5 @@ class RequestRecord(Base):
     )
     attempt_count: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
     )

@@ -10,9 +10,9 @@ class Settings(BaseModel):
     database_pool_size: int = Field(default=5, ge=1)
     database_max_overflow: int = Field(default=10, ge=0)
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)
-    provider_a_url: HttpUrl = HttpUrl("http://92.114.51.251:8001/v1/process")
-    provider_b_url: HttpUrl = HttpUrl("http://92.114.51.251:8002/v1/process")
-    provider_c_url: HttpUrl = HttpUrl("http://92.114.51.251:8003/v1/process")
+    provider_a_url: HttpUrl
+    provider_b_url: HttpUrl
+    provider_c_url: HttpUrl
     provider_a_concurrency: int = Field(default=10, ge=1)
     provider_b_concurrency: int = Field(default=10, ge=1)
     provider_c_concurrency: int = Field(default=10, ge=1)
@@ -40,6 +40,22 @@ class Settings(BaseModel):
             raise ValueError(
                 "Keep-alive connections cannot exceed total connections"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_provider_urls(self) -> "Settings":
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        for url in (
+            self.provider_a_url, self.provider_b_url, self.provider_c_url
+        ):
+            host = (url.host or "").strip("[]")
+            if url.scheme != "https" and not (
+                url.scheme == "http" and host in local_hosts
+            ):
+                raise ValueError(
+                    "Provider URLs must use HTTPS; HTTP is allowed only for "
+                    "localhost, 127.0.0.1, or ::1"
+                )
         return self
 
     @classmethod

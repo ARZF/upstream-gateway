@@ -39,10 +39,10 @@ These rules apply to the entire repository.
 - Preserve bounded attempts, capacity release, and conservative retry behavior. Timeouts and upstream failures may follow real side effects; request IDs are not idempotency guarantees.
 - Use HTTPX `MockTransport`, synthetic payloads, and temporary SQLite databases for tests. Never contact live providers or send a valid live process request without explicit authorization.
 - Keep health probes independent of upstream provider calls and business writes. `/health` is liveness; `/ready` checks initialized local dependencies and database accessibility.
-- Preserve SQLite persistence and WAL handling. In Compose, keep the database URL under the mounted `/data` directory. Never delete local databases, prune persistent volumes, or run `docker compose down -v` without explicit approval.
+- PostgreSQL is the runtime database, with schema owned by Alembic; SQLite is used only for tests. While no real data exists, the initial migration may be edited in place instead of adding a revision; once real data exists, create new revisions. Never delete local databases, prune persistent volumes, or run `docker compose down -v` without explicit approval.
 - Settings are validated by `Settings.from_env()` from process variables; do not assume automatic dotenv loading. Compose loads runtime variables with `env_file: .env`.
 - Keep `.env` untracked and excluded from Docker; keep `.env.example` tracked, complete, and free of actual secrets. Do not overwrite, rename, or delete existing environment files without approval.
-- Do not log payloads, credentials, or raw internal errors. Treat persisted request/provider data as sensitive. Do not add Redis, PostgreSQL, Kubernetes, or other infrastructure unless requested.
+- Do not log payloads, credentials, or raw internal errors. Treat persisted request/provider data as sensitive. Do not add Redis, Kubernetes, or other infrastructure unless requested.
 
 ## Python environment and verification
 
@@ -51,7 +51,7 @@ These rules apply to the entire repository.
 - Run commands from the repository root. On Windows, use explicit PowerShell commands:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```

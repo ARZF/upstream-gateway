@@ -14,7 +14,6 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
 from app.db.database import Database
 from app.db.models import RequestRecord
 from app.main import create_app
@@ -32,15 +31,21 @@ class MockResponseStream(httpx.AsyncByteStream):
             yield chunk
 
 
+class FailingResponseStream(httpx.AsyncByteStream):
+    def __init__(self, error):
+        self.error = error
+
+    async def __aiter__(self):
+        yield b'{"partial":'
+        raise self.error
+
+
 @pytest.fixture
-def open_api(tmp_path):
+def open_api(tmp_path, settings_factory):
     @asynccontextmanager
     async def open_client(handler, **overrides):
-        settings = Settings(
+        settings = settings_factory(
             database_url=f"sqlite:///{tmp_path / 'test.db'}",
-            provider_a_url="http://provider-a/v1/process",
-            provider_b_url="http://provider-b/v1/process",
-            provider_c_url="http://provider-c/v1/process",
             **overrides,
         )
         app = create_app(settings, transport=httpx.MockTransport(handler))
@@ -81,8 +86,10 @@ async def test_health_endpoints_do_not_call_providers_or_store_records(open_api)
 
 
 @pytest.mark.asyncio
-async def test_readiness_tracks_startup_and_shutdown(tmp_path):
-    app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'lifecycle.db'}"))
+async def test_readiness_tracks_startup_and_shutdown(tmp_path, settings_factory):
+    app = create_app(settings_factory(
+        database_url=f"sqlite:///{tmp_path / 'lifecycle.db'}"
+    ))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway"
     ) as client:
@@ -139,12 +146,16 @@ async def test_readiness_fails_when_http_client_is_closed(open_api):
 
 
 @pytest.mark.asyncio
-async def test_failed_database_initialization_leaves_app_not_ready(tmp_path, monkeypatch):
+async def test_failed_database_initialization_leaves_app_not_ready(
+    tmp_path, monkeypatch, settings_factory
+):
     def initialize(_):
         raise OperationalError("initialize", {}, Exception("private database path"))
 
     monkeypatch.setattr(Database, "initialize", initialize)
-    app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'failed.db'}"))
+    app = create_app(settings_factory(
+        database_url=f"sqlite:///{tmp_path / 'failed.db'}"
+    ))
     with pytest.raises(OperationalError):
         async with app.router.lifespan_context(app):
             pytest.fail("Startup must not succeed")
@@ -197,6 +208,21 @@ async def test_success_and_persistence(open_api, caplog):
         assert app.state.smart_router.providers["a"].successful_requests == 1
         assert len(calls) == 1
         assert "not-in-logs" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_long_provider_identifiers_are_persisted(open_api):
+    identifier = "x" * 300
+    provider_response = {"id": identifier, "request_id": identifier}
+
+    async with open_api(
+        lambda _: httpx.Response(200, json=provider_response)
+    ) as (app, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 200
+        record = get_record(app, response.json()["request_id"])
+        assert record.provider_transaction_id == identifier
+        assert record.provider_request_id == identifier
 
 
 @pytest.mark.asyncio
@@ -283,6 +309,43 @@ async def test_response_just_under_size_limit_succeeds(open_api):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type,expected_status,expected_code",
+    [
+        (httpx.ReadTimeout, 504, "timeout"),
+        (httpx.ReadError, 502, "transport_error"),
+    ],
+)
+async def test_mid_body_stream_failure_is_mapped_and_releases_capacity(
+    open_api, error_type, expected_status, expected_code
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.host)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=FailingResponseStream(
+                error_type("mock stream failure", request=request)
+            ),
+        )
+
+    async with open_api(handler) as (app, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == expected_status
+        assert response.json()["error"]["code"] == expected_code
+        assert calls == ["provider-a"]
+        provider = app.state.smart_router.providers["a"]
+        assert provider.active_requests == 0
+        assert provider.failed_requests == 1
+        assert not provider.semaphore.locked()
+        assert not app.state.smart_router.semaphore.locked()
+        record = get_record(app, response.json()["request_id"])
+        assert record.processing_status == "failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind,expected", [("timeout", 504), ("server", 502)])
 async def test_ambiguous_failures_not_retried_by_default(open_api, kind, expected):
     calls = []
@@ -332,6 +395,36 @@ async def test_total_deadline_persists_failure_and_releases_capacity(open_api):
         provider = app.state.smart_router.providers["a"]
         assert provider.active_requests == 0
         assert not provider.semaphore.locked()
+        assert not app.state.smart_router.semaphore.locked()
+
+
+@pytest.mark.asyncio
+async def test_total_deadline_is_shared_across_fallback_attempts(open_api):
+    calls = []
+
+    async def handler(request):
+        calls.append(request.url.host)
+        if request.url.host == "provider-a":
+            raise httpx.ConnectError("mock connection failure", request=request)
+        if request.url.host == "provider-b":
+            await asyncio.sleep(0.8)
+            return httpx.Response(200, json={})
+        pytest.fail("The deadline must prevent a third attempt")
+
+    async with open_api(
+        handler, total_deadline_seconds=0.3,
+        retry_ambiguous_failures=True, max_attempts=3,
+    ) as (app, client):
+        response = await client.post("/api/v1/process", json={"payload": {}})
+        assert response.status_code == 504
+        assert response.json()["error"]["code"] == "deadline_exceeded"
+        assert calls == ["provider-a", "provider-b"]
+        record = get_record(app, response.json()["request_id"])
+        assert record.attempt_count == 2
+        assert record.processing_status == "failed"
+        for provider in app.state.smart_router.providers.values():
+            assert provider.active_requests == 0
+            assert not provider.semaphore.locked()
         assert not app.state.smart_router.semaphore.locked()
 
 
@@ -564,9 +657,11 @@ async def test_overload_rejected_without_waiting(open_api):
 
 
 @pytest.mark.asyncio
-async def test_uvicorn_startup_and_endpoint_over_real_socket(tmp_path):
+async def test_uvicorn_startup_and_endpoint_over_real_socket(
+    tmp_path, settings_factory
+):
     app = create_app(
-        Settings(database_url=f"sqlite:///{tmp_path / 'smoke.db'}"),
+        settings_factory(database_url=f"sqlite:///{tmp_path / 'smoke.db'}"),
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"id": "smoke"})),
     )
     with socket.socket() as sock:

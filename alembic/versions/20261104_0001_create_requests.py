@@ -22,8 +22,8 @@ def upgrade() -> None:
         sa.Column("selected_provider", sa.String(length=16), nullable=True),
         sa.Column("request_payload", sa.JSON(), nullable=False),
         sa.Column("provider_response", sa.JSON(), nullable=True),
-        sa.Column("provider_transaction_id", sa.String(length=255), nullable=True),
-        sa.Column("provider_request_id", sa.String(length=255), nullable=True),
+        sa.Column("provider_transaction_id", sa.Text(), nullable=True),
+        sa.Column("provider_request_id", sa.Text(), nullable=True),
         sa.Column("http_status_code", sa.Integer(), nullable=False),
         sa.Column("upstream_http_status_code", sa.Integer(), nullable=True),
         sa.Column("processing_status", sa.String(length=32), nullable=False),
@@ -33,7 +33,9 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("request_id"),
     )
+    op.create_index("ix_requests_created_at", "requests", ["created_at"])
 
 
 def downgrade() -> None:
+    op.drop_index("ix_requests_created_at", table_name="requests")
     op.drop_table("requests")

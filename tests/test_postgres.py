@@ -9,7 +9,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
 from app.db.models import RequestRecord
 from app.main import create_app
 
@@ -44,17 +43,21 @@ def postgres_url(monkeypatch):
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_postgres_migration_startup_and_persistence(postgres_url):
+async def test_postgres_migration_startup_and_persistence(
+    postgres_url, settings_factory
+):
+    identifier = "x" * 300
     command.upgrade(Config("alembic.ini"), "head")
     app = create_app(
-        Settings(
+        settings_factory(
             database_url=postgres_url,
-            provider_a_url="http://provider-a/v1/process",
-            provider_b_url="http://provider-b/v1/process",
-            provider_c_url="http://provider-c/v1/process",
         ),
         transport=httpx.MockTransport(
-            lambda _: httpx.Response(200, json={"nested": [1, None]})
+            lambda _: httpx.Response(200, json={
+                "id": identifier,
+                "request_id": identifier,
+                "nested": [1, None],
+            })
         ),
     )
 
@@ -71,7 +74,9 @@ async def test_postgres_migration_startup_and_persistence(postgres_url):
         with Session(app.state.database.engine) as session:
             record = session.get(RequestRecord, request_id)
             assert record.request_payload == {"json": [True, None]}
-            assert record.provider_response == {"nested": [1, None]}
+            assert record.provider_response["nested"] == [1, None]
+            assert record.provider_transaction_id == identifier
+            assert record.provider_request_id == identifier
             assert record.created_at.utcoffset() is not None
         assert app.state.database.engine.pool.checkedout() == 0
 

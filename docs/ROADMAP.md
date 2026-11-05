@@ -41,7 +41,8 @@ The project aims to provide:
 - [x] HTTP 429 handling
 - [x] Cooldown behavior (initial verification)
 
-Note: Exact cooldown duration and concurrency limits still require dedicated automated tests.
+Note: Cooldown start and manual-expiration behavior are covered. Expiration
+driven by controlled time still needs a dedicated automated test.
 
 ## 3. Development Roadmap
 
@@ -51,11 +52,11 @@ Priority: High
 
 - [x] Implement an overall request deadline.
 - [x] Add request and response body size limits.
-- [ ] Review retry behavior for ambiguous failures.
-- [ ] Improve timeout and cancellation handling.
-- [ ] Add automated tests for cooldown expiration.
-- [ ] Add concurrency and overload tests.
-- [ ] Verify behavior when all providers are unavailable.
+- [x] Review retry behavior for ambiguous failures.
+- [x] Improve timeout and cancellation handling.
+- [ ] Add an automated cooldown-expiration test using controlled time.
+- [x] Add concurrency and overload tests.
+- [x] Verify behavior when all providers are unavailable.
 
 ### Phase 2 — Architecture and Scalability
 

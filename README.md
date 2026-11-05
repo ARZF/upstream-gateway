@@ -11,7 +11,7 @@ Windows PowerShell:
 
 ```powershell
 py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
@@ -20,7 +20,7 @@ Linux/macOS with Python 3.14+:
 
 ```sh
 python3.14 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m alembic upgrade head
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
@@ -72,13 +72,10 @@ set +a
 .venv/bin/python -m uvicorn app.main:app --workers 1
 ```
 
-Provider URLs are full process endpoint URLs and default to:
+All three provider URLs are required full process endpoint URLs. HTTPS is always
+allowed. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1`.
 
-- A: `http://92.114.51.251:8001/v1/process`
-- B: `http://92.114.51.251:8002/v1/process`
-- C: `http://92.114.51.251:8003/v1/process`
-
-The defaults allow 10 concurrent calls per provider, 20 concurrent upstream
+Default limits allow 10 concurrent calls per provider, 20 concurrent upstream
 calls overall, and at most two distinct provider attempts per incoming request.
 `MAX_ATTEMPTS=1` disables fallback, and the maximum permitted value is 3.
 Connection/read/write/pool timeouts default to 2/10/5/1 seconds respectively.
@@ -106,14 +103,14 @@ by Git and Docker; it is never copied into the image. `.env.example` stays track
 
 Compose uses `env_file: .env` to supply runtime variables. `DATABASE_URL` must
 use `postgres` as its hostname because that is the Compose database service
-name. Missing settings retain application defaults; invalid settings prevent
-startup. If credentials contain URL-reserved characters, percent-encode them in
-`DATABASE_URL` while keeping their literal values in `POSTGRES_PASSWORD`.
+name. Missing optional settings retain application defaults; missing provider
+URLs or invalid settings prevent startup. If credentials contain URL-reserved
+characters, percent-encode them in `DATABASE_URL` while keeping their literal
+values in `POSTGRES_PASSWORD`.
 
-Provider URLs must be reachable **from the container**. `127.0.0.1` and
-`localhost` refer to the gateway container, not the host. For host-based test
-providers on Docker Desktop, use `host.docker.internal` instead; Linux Engine
-requires separate host networking configuration if you need that arrangement.
+Provider URLs must be reachable **from the container**. `127.0.0.1`, `::1`, and
+`localhost` refer to the gateway container, not the host. Providers elsewhere,
+including `host.docker.internal`, must expose HTTPS.
 
 ### Build, start, and inspect
 
@@ -126,9 +123,8 @@ docker compose logs -f gateway
 ```
 
 The API is available at <http://localhost:8000>, with docs at
-<http://localhost:8000/docs>. Port 8000 is published on all host interfaces;
-restrict access with host firewall rules before exposing it beyond a trusted
-network. This Docker setup does not add authentication or TLS.
+<http://localhost:8000/docs>. Compose publishes port 8000 on localhost only.
+An authenticated TLS reverse proxy is required before any wider exposure.
 
 The gateway image uses official Python 3.14 slim, caches the dependency
 installation layer separately from application code, and runs as UID/GID 10001.
@@ -189,6 +185,20 @@ Inspect recent records without publishing PostgreSQL's port:
 ```sh
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT request_id, processing_status, created_at FROM requests ORDER BY created_at DESC LIMIT 20"'
 ```
+
+### Data retention
+
+Choose a retention period based on operational and legal needs; 30 days is an
+example, not a default. Run deletion from a scheduled external job such as cron
+or `pg_cron` rather than from every gateway process:
+
+```sh
+docker compose exec postgres psql -U gateway -d upstream_gateway -c "DELETE FROM requests WHERE created_at < now() - interval '30 days';"
+```
+
+Adjust the database user, database name, and period for the deployment. Request
+and provider payloads are sensitive. PostgreSQL autovacuum, or a planned manual
+`VACUUM`, reclaims space after deletion.
 
 ### Schema migrations
 
@@ -393,6 +403,9 @@ logged in full. Protect the database as sensitive data.
 .venv/bin/python -m pytest -q
 ```
 
+GitHub Actions runs the same suite against PostgreSQL 17 on every push and pull
+request, including the PostgreSQL-marked integration test.
+
 Tests use HTTPX `MockTransport` exclusively for external APIs and temporary
 SQLite databases. They cover success, selection, varying responses, timeouts,
 429 seconds/HTTP-date cooldowns, 5xx, fallback bounds, non-retryable 4xx, no
@@ -419,8 +432,8 @@ TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/upstream_gat
   admission/routing state is needed before scaling that way.
 - This is a local backend, not an authenticated public API. Add authentication,
   TLS, chunked-upload enforcement, traffic limits, retention, and access controls
-  before internet exposure. The supplied provider URLs use unencrypted HTTP; do
-  not send sensitive production data without a secure provider connection.
+  before internet exposure. Do not send sensitive production data without secure
+  provider connections.
 - PostgreSQL makes request history shareable, but router statistics, cooldowns,
   semaphores, and concurrency limits remain process-local. Keep one Uvicorn
   worker and one gateway replica until routing state and admission are shared.
