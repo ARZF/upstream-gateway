@@ -324,9 +324,10 @@ scored as:
 average_latency_ms + error_penalty_ms * (recent_failures / recent_attempts)
 ```
 
-The last 50 completed attempts per provider form a bounded statistics window.
-Cancelled attempts count as failures but do not quarantine the provider. All
-observed HTTP errors count as failures for scoring, including client 4xx. New
+The last 50 scored attempts per provider form a bounded statistics window.
+Cancelled attempts count as failures but do not quarantine the provider. Upstream
+4xx responses other than 429 do not affect samples, scores, or cooldowns; 429
+and other provider errors still count as failures for scoring. New
 providers start with a 1000 ms latency estimate and no failures. Ties follow
 configuration order (A, B, C). There is no background probing or periodic
 exploration: untried providers get traffic when their score or availability

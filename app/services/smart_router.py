@@ -93,6 +93,13 @@ class SmartRouter:
         self, provider: ProviderState, latency_ms: float,
         *, success: bool, error: ProviderError | None = None,
     ) -> None:
+        if (
+            not success and error is not None
+            and error.status_code is not None
+            and 400 <= error.status_code < 500
+            and error.status_code != 429
+        ):
+            return
         provider.samples.append((success, latency_ms))
         now = monotonic()
         if not success and error is not None:

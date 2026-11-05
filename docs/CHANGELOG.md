@@ -11,3 +11,4 @@
 
 - Updated `AGENTS.md` to require reading the changelog before editing and adding an Unreleased entry for every task that changes repository files, including documentation-only changes.
 - Migrated runtime persistence from SQLite to PostgreSQL with psycopg pooling, Alembic migrations, ordered Compose startup, and retained SQLite tests.
+- Excluded upstream 4xx responses other than 429 from provider routing samples, scores, and cooldowns.

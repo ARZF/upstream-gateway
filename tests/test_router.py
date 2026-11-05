@@ -74,6 +74,41 @@ def test_bounded_recent_statistics_and_recovery():
     assert a.average_latency_ms == 15
 
 
+@pytest.mark.parametrize("has_success_sample", [False, True])
+def test_client_4xx_does_not_change_provider_score(has_success_sample):
+    router = SmartRouter(Settings())
+    provider = router.providers["a"]
+    if has_success_sample:
+        router.record(provider, 100, success=True)
+    samples = list(provider.samples)
+    score = router.score(provider)
+
+    for latency in [10, 200, 500]:
+        router.record(provider, latency, success=False, error=ProviderError(
+            "upstream_rejected", "mock", retryable=False, status_code=422,
+        ))
+        assert provider.failed_requests == 0
+        assert list(provider.samples) == samples
+        assert router.score(provider) == score
+        assert provider.unavailable_until == provider.rate_limited_until == 0
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_rate_limit_and_server_errors_still_count_as_failures(status):
+    router = SmartRouter(Settings())
+    provider = router.providers["a"]
+    router.record(provider, 100, success=False, error=ProviderError(
+        "rate_limited" if status == 429 else "upstream_server_error",
+        "mock", retryable=True, status_code=status,
+    ))
+    assert provider.failed_requests == 1
+    assert list(provider.samples) == [(False, 100)]
+    if status == 429:
+        assert provider.rate_limited
+    else:
+        assert not provider.available
+
+
 def test_rate_limit_is_not_concurrency_or_shortened_by_later_responses():
     router = SmartRouter(Settings())
     a = router.providers["a"]
