@@ -44,18 +44,13 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_urls(self) -> "Settings":
-        local_hosts = {"localhost", "127.0.0.1", "::1"}
         for url in (
-            self.provider_a_url, self.provider_b_url, self.provider_c_url
+            self.provider_a_url,
+            self.provider_b_url,
+            self.provider_c_url,
         ):
-            host = (url.host or "").strip("[]")
-            if url.scheme != "https" and not (
-                url.scheme == "http" and host in local_hosts
-            ):
-                raise ValueError(
-                    "Provider URLs must use HTTPS; HTTP is allowed only for "
-                    "localhost, 127.0.0.1, or ::1"
-                )
+            if url.scheme not in {"http", "https"}:
+                raise ValueError("Provider URLs must use HTTP or HTTPS")
         return self
 
     @classmethod

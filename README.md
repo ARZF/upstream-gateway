@@ -72,8 +72,9 @@ set +a
 .venv/bin/python -m uvicorn app.main:app --workers 1
 ```
 
-All three provider URLs are required full process endpoint URLs. HTTPS is always
-allowed. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, or `::1`.
+All three provider URLs are required full process endpoint URLs.
+Both HTTP and HTTPS are supported. HTTPS is strongly recommended for
+external providers, especially in production.
 
 Default limits allow 10 concurrent calls per provider, 20 concurrent upstream
 calls overall, and at most two distinct provider attempts per incoming request.
@@ -108,9 +109,11 @@ URLs or invalid settings prevent startup. If credentials contain URL-reserved
 characters, percent-encode them in `DATABASE_URL` while keeping their literal
 values in `POSTGRES_PASSWORD`.
 
-Provider URLs must be reachable **from the container**. `127.0.0.1`, `::1`, and
-`localhost` refer to the gateway container, not the host. Providers elsewhere,
-including `host.docker.internal`, must expose HTTPS.
+Provider URLs must be reachable from the gateway container. `127.0.0.1`,
+`::1`, and `localhost` refer to the gateway container, not the host.
+For providers running on the Docker host, use `host.docker.internal`.
+Both HTTP and HTTPS are supported, but HTTPS is strongly recommended
+for external providers, especially in production.
 
 ### Build, start, and inspect
 
